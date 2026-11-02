@@ -173,8 +173,9 @@ pub fn burn(
     }
 }
 
-/// Data `[3, proof, root, nf_0, nf_1, cm_0, cm_1, audit blob, recipient
-/// blobs]`. Accounts: pool (w), payer (s, w), nullifier PDA 0 (w),
+/// Data `[3, proof, root slot, nf_0, nf_1, cm_0, cm_1, audit blob, recipient
+/// blobs]`. `root_slot` is the root's position in the pool's history
+/// (`Pool::find_root`). Accounts: pool (w), payer (s, w), nullifier PDA 0 (w),
 /// nullifier PDA 1 (w), system program, verifier program, transfer key.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer(
@@ -182,17 +183,18 @@ pub fn transfer(
     config: &PoolConfig,
     payer: &Address,
     proof: &[u8; PROOF_SIZE],
-    root: &[u8; 32],
+    root_slot: u8,
     nullifiers: &[[u8; 32]; 2],
     commitments: &[[u8; 32]; 2],
     audit_blob: &[u8; blob::audit_len(2)],
     enc_blobs: &[u8; 2 * blob::RECIPIENT_LEN],
 ) -> Instruction {
-    let mut data =
-        Vec::with_capacity(1 + PROOF_SIZE + 5 * 32 + blob::audit_len(2) + 2 * blob::RECIPIENT_LEN);
+    let mut data = Vec::with_capacity(
+        1 + PROOF_SIZE + 1 + 4 * 32 + blob::audit_len(2) + 2 * blob::RECIPIENT_LEN,
+    );
     data.push(PoolTag::Transfer as u8);
     data.extend_from_slice(proof);
-    data.extend_from_slice(root);
+    data.push(root_slot);
     data.extend_from_slice(&nullifiers[0]);
     data.extend_from_slice(&nullifiers[1]);
     data.extend_from_slice(&commitments[0]);

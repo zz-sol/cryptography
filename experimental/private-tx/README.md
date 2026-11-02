@@ -34,6 +34,8 @@ custodian reading every output.
 | `fixtures/<circuit>/` | a key, proof and public witness per circuit, consumed by `e2e/` |
 | `fixtures/pool/` | a whole pool lifecycle: shields, a transfer and burns with their ciphertexts, built through `client/` |
 | `program/` | Rust crate (own workspace): the pool program, Pinocchio SBF, with host-side instruction builders behind the `instruction` feature |
+| `cli/` | Rust crate (own workspace): `privtx-cli`, the live-cluster client: key registration, pool creation, transactions, RPC indexing |
+| `demo.sh` | the whole flow on a local validator, checked on-chain |
 | `e2e/` | Rust crate (own workspace): fixture → on-chain format → verifier host path, verifier SBF program, the pool program under Mollusk; plus the indexer and wallet decryption (`curve`, `encrypt`, `indexer`) |
 
 ## Poseidon
@@ -319,7 +321,7 @@ Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
 | --- | --- | --- | --- |
 | `InitializePool` | pool (s, w), vault, token program | custodian, issuer, mint_key, burn_key, transfer_key, token_mint, audit_pk | checks the vault is an initialized token account of the mint owned by the vault authority; fills the empty tree (32 Poseidon calls), pushes the empty root |
 | `Mint` (shield) | pool (w), issuer (s), verifier, mint key, source token account (w), source owner (s), vault (w), token program | proof, commitment, value, audit blob (160), recipient blob (83) | `audit_hash` from the blobs and `audit_pk`; verify `(commitment, value, audit_hash)`; transfer `value` source → vault (source owner's authority); append; `supply += value` |
-| `Transfer` | pool (w), payer (s, w), nullifier PDA 0 (w), nullifier PDA 1 (w), system, verifier, transfer key | proof, root, nf_0, nf_1, cm_0, cm_1, audit blob (256), recipient blobs (166) | root ∈ history; `nf_0 ≠ nf_1`; `audit_hash`, `enc_hash`, `sighash` from the data; verify `(root, nf_0, nf_1, cm_0, cm_1, audit_hash, sighash)`; create both PDAs; append both |
+| `Transfer` | pool (w), payer (s, w), nullifier PDA 0 (w), nullifier PDA 1 (w), system, verifier, transfer key | proof, root slot (1), nf_0, nf_1, cm_0, cm_1, audit blob (256), recipient blobs (166) | root = history[slot]; `nf_0 ≠ nf_1`; `audit_hash`, `enc_hash`, `sighash` from the data; verify `(root, nf_0, nf_1, cm_0, cm_1, audit_hash, sighash)`; create both PDAs; append both |
 | `Burn` (unshield / forfeit) | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced), vault (w), destination token account (w), vault authority, token program | proof, root, nullifier, value, forced | root ∈ history; `sighash = Poseidon(SIGHASH, pool, destination, nullifier, value)` with the destination account's address; verify `(root, nullifier, value, forced, sighash)`; create the PDA; transfer `value` vault → destination (PDA authority); `supply -= value` |
 
 The destination of a burn is a token account named in the instruction, and
@@ -334,8 +336,9 @@ Compute units under Mollusk (SBF v2, local): `InitializePool` 39.3k; `Mint`
 syscalls for the hashes, the token transfer); `Transfer` 206k (seven public
 inputs, 64 Poseidon syscalls for two appends, three wide ones for the
 hashes, two PDA creations); `Burn` 103k (unshield or forfeit). A `Transfer`
-instruction is 839 bytes of data, which with seven accounts fits a legacy
-transaction.
+names its root by history slot (one byte) instead of value: with that, the
+instruction is 808 bytes of data and the transaction, with its compute
+budget instruction, 1,217 of the 1,232 bytes a legacy transaction allows.
 
 What it does not do yet: Token-2022 extensions are untested (the layout
 check and `Transfer` are the same, but transfer fees or hooks would break
@@ -372,6 +375,45 @@ with another destination, tampered ciphertexts, wrong vault or token
 program, a depositor who cannot cover the note, tampered public inputs,
 wrong key, wrong PDA.
 
+## Demo on a local validator
+
+`make demo` (or `./demo.sh`) runs the protocol on `solana-test-validator`
+with everything checked on-chain:
+
+1. starts a validator with the verifier program and the pool program
+   loaded at their declared ids (`--bpf-program`, so no keypairs needed);
+2. registers the three verifying keys through the verifier's staging
+   flow (`privtx-cli register-vk`);
+3. creates a public token A, a depositor account holding 10 A and an empty
+   destination account (`token-setup`), then a pool over A with a vault
+   owned by the vault authority PDA and the custodian's audit key
+   (`create-pool`);
+4. **shield**: `privtx shield` proves a 3 A note for Alice, `privtx-cli
+   shield` sends the `Mint`; the depositor's balance drops by 3 A, the
+   vault's rises by 3 A, the pool's supply and leaf count follow;
+5. `privtx-cli ledger` reads the pool's transaction history over RPC,
+   rebuilds the tree (its root is checked against the pool account) and
+   writes the ledger; `privtx scan` finds Alice's note by trial decryption;
+6. **transfer**: `privtx transfer` proves Alice paying Bob 2 A with 1 A
+   change, `privtx-cli transfer` sends it; the vault and supply do not
+   move, two nullifiers and two leaves appear; Alice then sees her change
+   and Bob his payment;
+7. **unshield**: `privtx unshield` proves Bob's burn to the destination
+   account, `privtx-cli unshield` sends it; the destination gains 2 A, the
+   vault loses 2 A; Bob's wallet sees nothing left, Alice still her change.
+
+Keys, proofs, the ledger and the validator log go under `target/demo/`
+(`DEMO_DIR` to change); `KEEP=1` leaves the validator running. The Groth16
+setup is a development one, run once and persisted (`privtx setup`,
+transfer's proving key is 8.5 MB). Transactions carry a compute budget
+instruction: a `Transfer` costs about 206k CU, above the 200k default.
+
+The Go side is `privtx`'s wallet subcommands (`setup`, `keygen`,
+`audit-keygen`, `address`, `shield`, `scan`, `transfer`, `unshield`), each
+writing a JSON the Rust CLI turns into an instruction; addresses crossing
+the boundary are hex. The Rust side depends on the e2e crate for the
+indexer and decryption code, so the demo and the Mollusk test share it.
+
 ## Circuit rules
 
 - Plain Groth16 only. No `std/rangecheck` or anything else built on
@@ -393,6 +435,7 @@ make verifier-sbf   # clone + build the verifier program (needs cargo build-sbf 
 make pool-sbf       # build the pool program
 make test-e2e       # now also verifies the proofs inside the SBF program and runs the pool lifecycle
 make fixtures       # regenerate fixtures (random setup: bytes change)
+make demo           # shield → transfer → unshield on a local validator (needs solana-test-validator)
 ```
 
 The e2e and program crates are standalone Cargo workspaces: Mollusk brings
@@ -422,9 +465,8 @@ no tag newer than the required commit, so it stays on that commit.
   fields, and the fvk registration flow with the custodian.
 - Relayer fees and a public-value field in `C_transfer`, so a relayer can
   submit on a user's behalf.
-- A client against a real cluster: the indexer over RPC transaction
-  history (or program logs) instead of the instructions in hand, and the
-  prover as a service the wallet calls.
+- The prover as a service the wallet calls, and a wallet that keeps its
+  own state instead of rescanning; the demo's CLI is one shot per step.
 - Cross-pool transfers (`C_crosspool`, the claim accumulator, the
   receiving institution's co-signature).
 - Pool program: a real program id, Token-2022 coverage, a Groth16

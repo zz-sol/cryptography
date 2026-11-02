@@ -47,8 +47,8 @@ impl Indexer {
                 self.nullifiers.push(word(1 + PROOF_SIZE + 32));
             }
             3 => {
-                // Transfer: tag, proof, root, nf0, nf1, cm0, cm1, audit blob, enc blobs.
-                let o = 1 + PROOF_SIZE + 32;
+                // Transfer: tag, proof, root slot, nf0, nf1, cm0, cm1, audit blob, enc blobs.
+                let o = 1 + PROOF_SIZE + 1;
                 self.nullifiers.push(word(o));
                 self.nullifiers.push(word(o + 32));
                 let blobs = &d[d.len() - 2 * blob::RECIPIENT_LEN..];

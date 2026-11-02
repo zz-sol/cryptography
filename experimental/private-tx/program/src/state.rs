@@ -200,6 +200,20 @@ impl<'a> Pool<'a> {
         self.field(ROOTS_OFFSET, last)
     }
 
+    /// The root in history slot `slot`, if the slot is in range and filled.
+    pub fn root_at(&self, slot: usize) -> Option<[u8; 32]> {
+        if slot >= ROOT_HISTORY {
+            return None;
+        }
+        let r = *self.field(ROOTS_OFFSET, slot);
+        (r != [0u8; 32]).then_some(r)
+    }
+
+    /// The history slot holding `root`, if any.
+    pub fn find_root(&self, root: &[u8; 32]) -> Option<usize> {
+        (0..ROOT_HISTORY).find(|&i| self.root_at(i) == Some(*root))
+    }
+
     /// Whether `root` is one of the last `ROOT_HISTORY` roots.
     pub fn knows_root(&self, root: &[u8; 32]) -> bool {
         // Unused slots are zero, and zero is not a root of this tree (the

@@ -2,8 +2,13 @@
 //!
 //! Accounts: `[pool (w), payer (s, w), nullifier PDA 0 (w), nullifier PDA 1
 //! (w), system program, verifier program, transfer key]`.
-//! Data: `proof (256) ‖ root (32) ‖ nf_0 (32) ‖ nf_1 (32) ‖ cm_0 (32) ‖ cm_1 (32)
+//! Data: `proof (256) ‖ root slot (1) ‖ nf_0 (32) ‖ nf_1 (32) ‖ cm_0 (32) ‖ cm_1 (32)
 //! ‖ audit blob (256) ‖ recipient blobs (2 × 83)`.
+//!
+//! The root is named by its slot in the pool's root history rather than
+//! spelled out: the proof binds the root itself, and the 31 bytes saved
+//! are what keep a `Transfer` with its compute-budget instruction inside
+//! one legacy transaction (1,217 of 1,232 bytes).
 //!
 //! The proof is `C_transfer` with public inputs `(root, nf_0, nf_1, cm_0,
 //! cm_1, audit_hash, sighash)`. The program recomputes `audit_hash` from
@@ -50,7 +55,7 @@ pub fn process(
     }
 
     let (proof, rest) = take::<PROOF_SIZE>(payload)?;
-    let (root, rest) = take::<32>(rest)?;
+    let (root_slot, rest) = take::<1>(rest)?;
     let (nf0, rest) = take::<32>(rest)?;
     let (nf1, rest) = take::<32>(rest)?;
     let (cm0, rest) = take::<32>(rest)?;
@@ -65,13 +70,13 @@ pub fn process(
     }
 
     let pool_address = *pool.address();
-    let (audit, sighash) = {
+    let (root, audit, sighash) = {
         let mut data = pool.try_borrow_mut()?;
         let p = Pool::from_bytes(&mut data)?;
         expect_verifier(verifier, key, p.transfer_key())?;
-        if !p.knows_root(root) {
-            return Err(PoolError::UnknownRoot.into());
-        }
+        let root = p
+            .root_at(root_slot[0] as usize)
+            .ok_or(PoolError::UnknownRoot)?;
         let audit = audit_hash(p.audit_pk(), audit_blob, &[])?;
         let eh = enc_hash(enc_blobs)?;
         let sighash = transfer_sighash(
@@ -81,10 +86,10 @@ pub fn process(
             &audit,
             &eh,
         )?;
-        (audit, sighash)
+        (root, audit, sighash)
     };
 
-    verify_proof(key, proof, &[*root, *nf0, *nf1, *cm0, *cm1, audit, sighash])?;
+    verify_proof(key, proof, &[root, *nf0, *nf1, *cm0, *cm1, audit, sighash])?;
 
     record_nullifier(program_id, pool, payer, nullifier_account_0, nf0)?;
     record_nullifier(program_id, pool, payer, nullifier_account_1, nf1)?;

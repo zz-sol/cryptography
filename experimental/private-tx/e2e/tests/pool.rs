@@ -361,12 +361,14 @@ fn transfer_ix(s: &Setup) -> Instruction {
         ],
         "transfer public inputs"
     );
+    let slot = with_pool(&s.w, &s.pool, |p| p.find_root(&bytes_from_hex(&t.root)))
+        .expect("the transfer's root is in the pool's history");
     pool_ix::transfer(
         &s.pool,
         &s.config,
         &s.payer,
         proof_bytes(&g.proof.0),
-        &bytes_from_hex(&t.root),
+        slot as u8,
         &nullifiers,
         &commitments,
         &arr(&audit_blob),
@@ -623,19 +625,27 @@ fn mint_rejects_wrong_issuer_key_vault_and_tampered_inputs() {
 fn transfer_rejects_tampering_and_double_spends() {
     let Some(mut s) = setup() else { return };
     shield_all(&mut s);
-    let root_off = 1 + PROOF_SIZE;
-    let audit_off = root_off + 5 * 32;
+    let root_off = 1 + PROOF_SIZE; // the root's history slot, one byte
+    let nf_off = root_off + 1;
+    let audit_off = nf_off + 4 * 32;
     let enc_off = audit_off + blob::audit_len(2);
 
-    // A root the pool never had.
+    // An empty history slot, or one past the history.
     let mut ix = transfer_ix(&s);
-    ix.data[root_off + 31] ^= 1;
+    ix.data[root_off] = 63;
     assert_pool_error(&s.w.run(&ix), PoolError::UnknownRoot);
+    let mut ix = transfer_ix(&s);
+    ix.data[root_off] = 64;
+    assert_pool_error(&s.w.run(&ix), PoolError::UnknownRoot);
+    // A root the pool did have (before the last shield), not the proof's.
+    let mut ix = transfer_ix(&s);
+    ix.data[root_off] -= 1;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
 
     // The same nullifier twice (one note spent as both inputs).
     let mut ix = transfer_ix(&s);
-    let nf0: Vec<u8> = ix.data[root_off + 32..root_off + 64].to_vec();
-    ix.data[root_off + 64..root_off + 96].copy_from_slice(&nf0);
+    let nf0: Vec<u8> = ix.data[nf_off..nf_off + 32].to_vec();
+    ix.data[nf_off + 32..nf_off + 64].copy_from_slice(&nf0);
     ix.accounts[3].pubkey = ix.accounts[2].pubkey;
     assert_pool_error(&s.w.run(&ix), PoolError::DuplicateNullifier);
 
@@ -651,11 +661,11 @@ fn transfer_rejects_tampering_and_double_spends() {
 
     // Another output commitment, or nullifier (with its PDA to match).
     let mut ix = transfer_ix(&s);
-    ix.data[root_off + 96 + 31] ^= 1;
+    ix.data[nf_off + 64 + 31] ^= 1;
     sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
     let mut ix = transfer_ix(&s);
-    ix.data[root_off + 32 + 31] ^= 1;
-    let nf: [u8; 32] = ix.data[root_off + 32..root_off + 64].try_into().unwrap();
+    ix.data[nf_off + 31] ^= 1;
+    let nf: [u8; 32] = ix.data[nf_off..nf_off + 32].try_into().unwrap();
     ix.accounts[2].pubkey = pool_ix::find_nullifier_address(&s.pool, &nf).0;
     sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
 
