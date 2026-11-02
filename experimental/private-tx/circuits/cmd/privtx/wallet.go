@@ -86,15 +86,32 @@ func setupCmd(args []string) error {
 			return err
 		}
 		report(filepath.Join(*keys, name), sizes)
+		// What the keys were made for, so a stale key is caught at load.
+		if err := writeJSON(filepath.Join(*keys, name+".json"), keyMeta{Constraints: p.CCS.GetNbConstraints()}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// loadProver reads the keys written by setup and recompiles the circuit.
+// keyMeta pins a key pair to the circuit it was set up for.
+type keyMeta struct {
+	Constraints int `json:"constraints"`
+}
+
+// loadProver reads the keys written by setup and recompiles the circuit,
+// refusing keys made for another version of it.
 func loadProver(keys, name string) (*client.Prover, error) {
 	ccs, err := circuits[name]()
 	if err != nil {
 		return nil, err
+	}
+	var meta keyMeta
+	if err := readJSON(filepath.Join(keys, name+".json"), &meta); err != nil {
+		return nil, fmt.Errorf("%s: %w (run `privtx setup`)", name, err)
+	}
+	if meta.Constraints != ccs.GetNbConstraints() {
+		return nil, fmt.Errorf("%s: keys in %s were set up for %d constraints, the circuit has %d: rerun `privtx setup`", name, keys, meta.Constraints, ccs.GetNbConstraints())
 	}
 	pk := groth16.NewProvingKey(ecc.BN254)
 	vk := groth16.NewVerifyingKey(ecc.BN254)
@@ -135,7 +152,7 @@ func keygenCmd(args []string) error {
 	} else if _, err := sk.SetRandom(); err != nil {
 		return err
 	}
-	if err := writeJSON(*out, walletFile{SK: note.Hex32(&sk)}); err != nil {
+	if err := writeSecretJSON(*out, walletFile{SK: note.Hex32(&sk)}); err != nil {
 		return err
 	}
 	w := client.Wallet{Key: note.NewSpendingKey(sk)}
@@ -181,7 +198,7 @@ func auditKeygenCmd(args []string) error {
 		return err
 	}
 	k := encrypt.NewAuditKey(sk)
-	if err := writeJSON(*out, auditFile{SK: note.Hex32(&sk), PKX: note.Hex32(&k.PK.X), PKY: note.Hex32(&k.PK.Y)}); err != nil {
+	if err := writeSecretJSON(*out, auditFile{SK: note.Hex32(&sk), PKX: note.Hex32(&k.PK.X), PKY: note.Hex32(&k.PK.Y)}); err != nil {
 		return err
 	}
 	fmt.Printf("audit_pk %s %s\n", note.Hex32(&k.PK.X), note.Hex32(&k.PK.Y))
@@ -449,11 +466,16 @@ func transferCmd(args []string) error {
 	owned := w.Scan(l)
 	var spends []client.Owned
 	var in uint64
+	seen := map[uint64]bool{}
 	for _, s := range strings.Split(*spend, ",") {
 		i, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
 		if err != nil {
 			return fmt.Errorf("-spend: %w", err)
 		}
+		if seen[i] {
+			return fmt.Errorf("-spend: leaf %d given twice", i)
+		}
+		seen[i] = true
 		found := false
 		for _, o := range owned {
 			if o.Index == i {
@@ -581,6 +603,20 @@ func unshieldCmd(args []string) error {
 		SigHash:     note.Hex32(&sh),
 		Destination: note.HexBytes32(&dest),
 	})
+}
+
+// writeSecretJSON is writeJSON for key material: owner-readable only.
+func writeSecretJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s (%d bytes, mode 0600)\n", path, len(data))
+	return nil
 }
 
 func readJSON(path string, v any) error {

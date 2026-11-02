@@ -61,9 +61,11 @@ func EmptyPath() Path {
 	return p
 }
 
-// Tree is an in-memory append-only tree.
+// Tree is an in-memory append-only tree. The levels are computed once per
+// state and reused by Root and Path until the next Append.
 type Tree struct {
 	leaves []fr.Element
+	cached [][]fr.Element
 }
 
 // Append adds a leaf and returns its index.
@@ -72,6 +74,7 @@ func (t *Tree) Append(leaf fr.Element) (uint64, error) {
 		return 0, fmt.Errorf("merkle: tree is full (%d leaves)", len(t.leaves))
 	}
 	t.leaves = append(t.leaves, leaf)
+	t.cached = nil
 	return uint64(len(t.leaves) - 1), nil
 }
 
@@ -84,6 +87,9 @@ func (t *Tree) Leaves() []fr.Element { return append([]fr.Element(nil), t.leaves
 // levels returns every level of the occupied part of the tree, leaves first;
 // positions past each level's length are the empty subtree of that height.
 func (t *Tree) levels() [][]fr.Element {
+	if t.cached != nil {
+		return t.cached
+	}
 	levels := make([][]fr.Element, Depth+1)
 	levels[0] = t.leaves
 	for h := 0; h < Depth; h++ {
@@ -99,6 +105,7 @@ func (t *Tree) levels() [][]fr.Element {
 		}
 		levels[h+1] = next
 	}
+	t.cached = levels
 	return levels
 }
 

@@ -9,9 +9,87 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/consensys/gnark-crypto/ecc/bn254/twistededwards"
+	tedwards "github.com/consensys/gnark-crypto/ecc/twistededwards"
+	"github.com/consensys/gnark/frontend"
+	gadgetted "github.com/consensys/gnark/std/algebra/native/twistededwards"
+	"github.com/consensys/gnark/test"
 )
+
+type groupHashCircuit struct {
+	GD gadgetted.Point `gnark:",public"`
+	D  frontend.Variable
+	W  GroupHashVars
+}
+
+func (c *groupHashCircuit) Define(api frontend.API) error {
+	curve, err := gadgetted.NewEdCurve(api, tedwards.BN254)
+	if err != nil {
+		return err
+	}
+	api.ToBinary(c.D, DiversifierSize*8)
+	return GroupHashGadget(api, curve, c.D, c.W, c.GD)
+}
+
+func TestGroupHashGadgetMatchesNative(t *testing.T) {
+	// Find diversifiers that hit at counter 0 and at a later counter, so
+	// both the non-residue proofs and the hit are exercised.
+	var first, later *Diversifier
+	for i := 0; i < 64 && (first == nil || later == nil); i++ {
+		d := DiversifierFromSeed([]byte{byte(i)})
+		w, err := d.GroupHashWitness()
+		if err != nil {
+			continue
+		}
+		if w.Ctr == 0 && first == nil {
+			d := d
+			first = &d
+		}
+		if w.Ctr > 0 && later == nil {
+			d := d
+			later = &d
+		}
+	}
+	if first == nil || later == nil {
+		t.Fatal("no diversifiers with counter 0 and > 0 among the first 64 seeds")
+	}
+	var valid []frontend.Circuit
+	for _, d := range []*Diversifier{first, later} {
+		w, _ := d.GroupHashWitness()
+		valid = append(valid, &groupHashCircuit{GD: PointVars(&w.GD), D: d.Element(), W: w.Vars()})
+	}
+	// Another point for the same d: the counter and roots cannot be faked.
+	w, _ := later.GroupHashWitness()
+	other := SpendingKeyFromSeed([]byte("x")).FullViewingKey().AK
+	wrongPoint := &groupHashCircuit{GD: PointVars(&other), D: later.Element(), W: w.Vars()}
+	// Claiming an earlier counter: the non-square there has no root, and
+	// the hit's x differs.
+	earlier := w
+	earlier.Ctr = 0
+	wrongCounter := &groupHashCircuit{GD: PointVars(&w.GD), D: later.Element(), W: earlier.Vars()}
+	// The larger root.
+	bigY := w
+	bigY.Y.Neg(&bigY.Y)
+	negP := w.GD
+	negP.X.Neg(&negP.X) // [8](x, -y) = (-gd.x, gd.y)
+	wrongRoot := &groupHashCircuit{GD: PointVars(&negP), D: later.Element(), W: bigY.Vars()}
+	// Another diversifier with this witness.
+	wrongD := &groupHashCircuit{GD: PointVars(&w.GD), D: first.Element(), W: w.Vars()}
+
+	assert := test.NewAssert(t)
+	assert.CheckCircuit(&groupHashCircuit{},
+		test.WithValidAssignment(valid[0]),
+		test.WithValidAssignment(valid[1]),
+		test.WithInvalidAssignment(wrongPoint),
+		test.WithInvalidAssignment(wrongCounter),
+		test.WithInvalidAssignment(wrongRoot),
+		test.WithInvalidAssignment(wrongD),
+		test.WithCurves(ecc.BN254),
+		test.NoFuzzing(),
+	)
+}
 
 func TestKeyHierarchyIsDeterministicAndValid(t *testing.T) {
 	k := SpendingKeyFromSeed([]byte("seed"))

@@ -115,12 +115,16 @@ pub fn x_from_y(y: &Fr) -> Option<Fr> {
     (num / den).sqrt()
 }
 
+/// Tries the group hash makes before giving up on a diversifier, as the
+/// circuits replay it (`note.GroupHashTries`).
+pub const GROUP_HASH_TRIES: u64 = 8;
+
 /// The diversifier group hash (`note.Diversifier.GroupHash`): the first
 /// `x = Poseidon(GD, d, counter)` that is on the curve, smaller `y`,
 /// cleared of the cofactor.
 pub fn group_hash(d_bytes: &[u8; 11]) -> Option<Point> {
     let d_elem = Fr::from_be_bytes_mod_order(d_bytes);
-    for ctr in 0u64..256 {
+    for ctr in 0u64..GROUP_HASH_TRIES {
         let x = Fr::from_be_bytes_mod_order(&poseidon(&[
             domain_tag("privtx/gd"),
             d_elem,

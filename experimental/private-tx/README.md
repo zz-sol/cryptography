@@ -90,9 +90,17 @@ address = (d, pk_d)
 - One key has as many addresses as diversifiers; without `ivk` two of them
   are unlinkable (`pk_d = [ivk]g_d` with independent bases).
 - `GroupHash(d)`: `x = Poseidon(GD, d, counter)` for the first counter that
-  gives a curve point, smaller `y`, cofactor cleared. The circuits never
-  compute it; `g_d` is a witness checked to be on the curve and not of small
-  order, so `pk_d = [ivk]g_d` binds `ivk` modulo the full subgroup order.
+  gives a curve point, smaller `y`, cofactor cleared; at most 8 counters
+  (a diversifier needing more is unusable, probability 2⁻⁸). The circuits
+  that create notes replay it: the witness carries the counter, the point
+  before cofactor clearing and, for every earlier counter, a square root
+  of `5·rhs` (5 is a non-residue), which is what shows `rhs` was not a
+  square; the hit's `y` is checked to be the smaller root, and
+  `g_d = [8](x, y)`. Without this a self-shielder could commit to a base
+  that is not `GroupHash(d)`: spendable by them (spending never uses `d`),
+  unrecoverable from the audit ciphertext, so beyond forfeiture. `g_d` is
+  also checked not to be of small order, so `pk_d = [ivk]g_d` binds `ivk`
+  modulo the full subgroup order.
 
 ```
 note = (value, d, pk_d, r)
@@ -124,11 +132,13 @@ To the recipient, off-circuit, 83 bytes:
 
 ```
 esk random;  epk = [esk]·g_d;  ss = [esk]·pk_d = [ivk]·epk
-key  = Poseidon(KDF, ss.x, ss.y, epk.x, epk.y);  ks_i = Poseidon(ENC, key, i)
+key  = Poseidon(KDF, ss.x, ss.y, epk.x, epk.y);  ks_i = Poseidon(ENC, key, i)[1:32]
 blob = epk (compressed, 32) ‖ (value LE 8 ‖ d 11 ‖ r 32) ⊕ (ks_0 ‖ ks_1)[0:51]
 ```
 
-A wallet trial-decrypts every blob with `ivk`, derives `pk_d` from `d`,
+Each keystream element contributes its 31 low bytes: the top byte of a
+canonical field element is biased (always below 0x31) and would leak two
+bits of whatever it masked. A wallet trial-decrypts every blob with `ivk`, derives `pk_d` from `d`,
 recommits, and keeps the notes whose commitment is the leaf's: that check
 is the integrity check, as in Sapling, so there is no MAC. Nothing forces
 a sender to encrypt honestly; a garbage blob costs them the payment.
@@ -178,8 +188,8 @@ pool program's business (issuer authority), not the circuit's.
 | --- | --- |
 | public inputs | `commitment`, `value`, `audit_hash` (in that order) |
 | witness | `g_d`, `pk_d`, `r`, `d`, `apk`, `esk`, `enc_hash` |
-| constraints | `value ∈ [0, 2^64)` by bit decomposition; `d < 2^88`; `g_d` on the curve and not of small order, `pk_d` on the curve; `commitment = Poseidon(CM, value, g_d, pk_d, r)`; `audit_hash` over the note's audit ciphertext and `enc_hash` |
-| size | 9659 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+| constraints | `value ∈ [0, 2^64)` by bit decomposition; `d < 2^88`; `g_d = GroupHash(d)`, not of small order; `pk_d` on the curve; `commitment = Poseidon(CM, value, g_d, pk_d, r)`; `audit_hash` over the note's audit ciphertext and `enc_hash` |
+| size | 12587 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
 
 A confidential-issuance variant (hidden amount) is the same circuit with
 `Value` moved to the private witness. The point checks are Sapling's
@@ -208,8 +218,8 @@ owner, nullifier and signature, so every transaction has the same shape.
 | --- | --- |
 | public inputs | `root`, `nf_0`, `nf_1`, `cm_0`, `cm_1`, `audit_hash`, `sighash` (in that order) |
 | witness | per input: `ak`, `nk`, `g_d`, `pk_d`, `r`, `value`, leaf index, 32 siblings, signature; per output: `g_d`, `pk_d`, `r`, `value`, `d`; `apk`, `esk` |
-| constraints | per input: owner relation, `(root_i − root)·(1 − [value_i = 0]) = 0`, nullifier, `EdDSA.Verify(ak_i, sighash)`; per output: `value < 2^64`, `d < 2^88`, point checks, commitment; `Σ in = Σ out`; `audit_hash` over both outputs |
-| size | 53378 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+| constraints | per input: owner relation, `(root_i − root)·(1 − [value_i = 0]) = 0`, nullifier, `EdDSA.Verify(ak_i, sighash)`; per output: `value < 2^64`, `d < 2^88`, `g_d = GroupHash(d)`, point checks, commitment; `Σ in = Σ out`; `audit_hash` over both outputs |
+| size | 59234 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
 
 ```
 sighash = Poseidon(TSIGHASH, pool[0:16], pool[16:32], nf_0, nf_1, cm_0, cm_1, audit_hash, enc_hash)
@@ -319,7 +329,7 @@ Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
 
 | instruction | accounts | data | effect |
 | --- | --- | --- | --- |
-| `InitializePool` | pool (s, w), vault, token program | custodian, issuer, mint_key, burn_key, transfer_key, token_mint, audit_pk | checks the vault is an initialized token account of the mint owned by the vault authority; fills the empty tree (32 Poseidon calls), pushes the empty root |
+| `InitializePool` | pool (s, w), vault, token program | custodian, issuer, mint_key, burn_key, transfer_key, token_mint, audit_pk | token program must be classic SPL Token; checks the vault is an initialized token account of the mint owned by the vault authority; fills the empty tree (32 Poseidon calls), pushes the empty root |
 | `Mint` (shield) | pool (w), issuer (s), verifier, mint key, source token account (w), source owner (s), vault (w), token program | proof, commitment, value, audit blob (160), recipient blob (83) | `audit_hash` from the blobs and `audit_pk`; verify `(commitment, value, audit_hash)`; transfer `value` source → vault (source owner's authority); append; `supply += value` |
 | `Transfer` | pool (w), payer (s, w), nullifier PDA 0 (w), nullifier PDA 1 (w), system, verifier, transfer key | proof, root slot (1), nf_0, nf_1, cm_0, cm_1, audit blob (256), recipient blobs (166) | root = history[slot]; `nf_0 ≠ nf_1`; `audit_hash`, `enc_hash`, `sighash` from the data; verify `(root, nf_0, nf_1, cm_0, cm_1, audit_hash, sighash)`; create both PDAs; append both |
 | `Burn` (unshield / forfeit) | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced), vault (w), destination token account (w), vault authority, token program | proof, root, nullifier, value, forced | root ∈ history; `sighash = Poseidon(SIGHASH, pool, destination, nullifier, value)` with the destination account's address; verify `(root, nullifier, value, forced, sighash)`; create the PDA; transfer `value` vault → destination (PDA authority); `supply -= value` |
@@ -340,10 +350,12 @@ names its root by history slot (one byte) instead of value: with that, the
 instruction is 808 bytes of data and the transaction, with its compute
 budget instruction, 1,217 of the 1,232 bytes a legacy transaction allows.
 
-What it does not do yet: Token-2022 extensions are untested (the layout
-check and `Transfer` are the same, but transfer fees or hooks would break
-the supply/vault equality); the program id is a placeholder; nothing is
-emitted for indexers beyond the instruction data itself.
+What it does not do yet: Token-2022 is refused at `InitializePool` rather
+than supported (a transfer-fee or transfer-hook extension would make the
+vault receive less than the note minted and break `supply == vault
+balance`; supporting it means accounting by vault balance delta); the
+program id is a placeholder; nothing is emitted for indexers beyond the
+instruction data itself.
 
 ## Client
 
@@ -404,9 +416,11 @@ with everything checked on-chain:
 
 Keys, proofs, the ledger and the validator log go under `target/demo/`
 (`DEMO_DIR` to change); `KEEP=1` leaves the validator running. The Groth16
-setup is a development one, run once and persisted (`privtx setup`,
-transfer's proving key is 8.5 MB). Transactions carry a compute budget
-instruction: a `Transfer` costs about 206k CU, above the 200k default.
+setup is a development one (`privtx setup`, seconds; transfer's proving
+key is 9 MB), persisted with the constraint count it was made for so a key
+from an older version of a circuit is refused rather than misused.
+Transactions carry a compute budget instruction: a `Transfer` costs about
+206k CU, above the 200k default.
 
 The Go side is `privtx`'s wallet subcommands (`setup`, `keygen`,
 `audit-keygen`, `address`, `shield`, `scan`, `transfer`, `unshield`), each
@@ -469,5 +483,5 @@ no tag newer than the required commit, so it stays on that commit.
   own state instead of rescanning; the demo's CLI is one shot per step.
 - Cross-pool transfers (`C_crosspool`, the claim accumulator, the
   receiving institution's co-signature).
-- Pool program: a real program id, Token-2022 coverage, a Groth16
-  ceremony or the Plonk fallback.
+- Pool program: a real program id, Token-2022 (by vault balance delta), a
+  Groth16 ceremony or the Plonk fallback.

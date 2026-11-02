@@ -10,7 +10,7 @@ use {
     anyhow::{anyhow, bail, Context, Result},
     clap::{Parser, Subcommand},
     groth16_convert::{arkworks, gnark, OnChainKey},
-    private_tx_e2e::{encrypt, indexer::Indexer},
+    private_tx_e2e::indexer::Indexer,
     private_tx_pool::{
         instruction::{self as pool_ix, PoolConfig},
         state::{blob, token_account, Pool, POOL_ACCOUNT_LEN},
@@ -371,14 +371,23 @@ fn token_balance(rpc: &RpcClient, account: &Address) -> Result<u64> {
 /// first, as an indexer would collect them.
 fn pool_instructions(rpc: &RpcClient, pool: &Address) -> Result<Vec<Instruction>> {
     // Confirmed, not the default finalized: the demo reads back what it
-    // just sent.
-    let mut sigs = rpc.get_signatures_for_address_with_config(
-        pool,
-        GetConfirmedSignaturesForAddress2Config {
-            commitment: Some(CommitmentConfig::confirmed()),
-            ..Default::default()
-        },
-    )?;
+    // just sent. Pages of up to 1,000 signatures, newest first, walked
+    // back with `before` until exhausted.
+    let mut sigs = Vec::new();
+    let mut before = None;
+    loop {
+        let page = rpc.get_signatures_for_address_with_config(
+            pool,
+            GetConfirmedSignaturesForAddress2Config {
+                before,
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..Default::default()
+            },
+        )?;
+        let Some(last) = page.last() else { break };
+        before = Some(Signature::from_str(&last.signature)?);
+        sigs.extend(page);
+    }
     sigs.reverse();
     let mut out = Vec::new();
     for s in sigs {
@@ -623,6 +632,9 @@ fn main() -> Result<()> {
             let pool = addr(&pool)?;
             let (_, config) = pool_config(&c.rpc, &pool)?;
             let f: UnshieldFile = read_json(&proof)?;
+            if f.forced {
+                bail!("a forced burn needs the custodian's signature; this command only signs as the payer");
+            }
             let (proof_bytes, inputs) = parse_proof(&f.proof)?;
             let nullifier = hex32(&f.nullifier)?;
             if inputs[1] != nullifier {
@@ -682,7 +694,6 @@ fn main() -> Result<()> {
                 }
             );
             println!("wrote {}", out.display());
-            let _ = encrypt::RECIPIENT_BLOB_LEN;
         }
         Cmd::Info {
             pool,

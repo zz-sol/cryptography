@@ -21,7 +21,7 @@ import (
 
 // NbConstraints is the R1CS size of the circuit as compiled by the pinned gnark
 // and Poseidon gadget versions; quoted in README.md.
-const NbConstraints = 9659
+const NbConstraints = 12587
 
 func randomNote(t *testing.T, value uint64) note.Note {
 	t.Helper()
@@ -83,6 +83,15 @@ func TestMintCircuit(t *testing.T) {
 	smallOrder.GD = twistededwards.Point{X: 0, Y: 1}
 	smallOrder.Commitment = commitmentWithGD(&n, 0, 1)
 
+	// A valid base that is not GroupHash(d): the custodian could never
+	// recompute this note from its audit ciphertext.
+	otherBase := assign(t, &n)
+	m := n
+	m.D = note.DiversifierFromSeed([]byte("other base"))
+	other := m.GD()
+	otherBase.GD = note.PointVars(&other)
+	otherBase.Commitment = m.Commitment()
+
 	// pk_d off the curve.
 	offCurve := assign(t, &n)
 	offCurve.PKD = twistededwards.Point{X: 1, Y: 1}
@@ -101,6 +110,7 @@ func TestMintCircuit(t *testing.T) {
 		test.WithInvalidAssignment(wrongValue),
 		test.WithInvalidAssignment(overflow),
 		test.WithInvalidAssignment(smallOrder),
+		test.WithInvalidAssignment(otherBase),
 		test.WithInvalidAssignment(offCurve),
 		test.WithInvalidAssignment(wrongAudit),
 		test.WithInvalidAssignment(wrongBlob),

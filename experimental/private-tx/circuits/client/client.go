@@ -41,12 +41,15 @@ type Ledger struct {
 	Leaves     []fr.Element
 	Blobs      [][]byte
 	Nullifiers map[fr.Element]bool
+
+	tree *merkle.Tree // rebuilt lazily, dropped on Append
 }
 
 // Append records a new leaf and its recipient blob.
 func (l *Ledger) Append(cm fr.Element, blob []byte) {
 	l.Leaves = append(l.Leaves, cm)
 	l.Blobs = append(l.Blobs, append([]byte(nil), blob...))
+	l.tree = nil
 }
 
 // Spend records a published nullifier.
@@ -57,15 +60,18 @@ func (l *Ledger) Spend(nf fr.Element) {
 	l.Nullifiers[nf] = true
 }
 
-// Tree rebuilds the commitment tree.
+// Tree is the commitment tree, rebuilt once per ledger state.
 func (l *Ledger) Tree() *merkle.Tree {
-	var tr merkle.Tree
-	for _, cm := range l.Leaves {
-		if _, err := tr.Append(cm); err != nil {
-			panic(err)
+	if l.tree == nil {
+		var tr merkle.Tree
+		for _, cm := range l.Leaves {
+			if _, err := tr.Append(cm); err != nil {
+				panic(err)
+			}
 		}
+		l.tree = &tr
 	}
-	return &tr
+	return l.tree
 }
 
 // Root is the current root.
@@ -166,6 +172,9 @@ type Transfer struct {
 func (w *Wallet) Pay(rng io.Reader, l *Ledger, pool [32]byte, apk *twistededwards.PointAffine, spends []Owned, payments [transfer.NumOutputs]Payment) (*Transfer, error) {
 	if len(spends) == 0 || len(spends) > transfer.NumInputs {
 		return nil, fmt.Errorf("client: %d inputs, want 1..%d", len(spends), transfer.NumInputs)
+	}
+	if len(spends) == 2 && spends[0].Index == spends[1].Index {
+		return nil, fmt.Errorf("client: leaf %d spent twice", spends[0].Index)
 	}
 	p := &transfer.Params{Pool: pool, Root: l.Root(), AuditPK: *apk}
 	for i := range p.Spends {

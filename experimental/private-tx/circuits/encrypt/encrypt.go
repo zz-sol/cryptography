@@ -12,7 +12,7 @@
 //	epk  = [esk]·g_d            (g_d of the recipient's address)
 //	ss   = [esk]·pk_d  = [ivk]·epk
 //	key  = Poseidon(KDF, ss.x, ss.y, epk.x, epk.y)
-//	ks_i = Poseidon(ENC, key, i)
+//	ks_i = Poseidon(ENC, key, i)[1:32]        (31 low bytes: the top byte of a field element is biased)
 //	blob = epk (32, compressed) ‖ (value LE 8 ‖ d 11 ‖ r 32) ⊕ (ks_0 ‖ ks_1)[0:51]
 //
 // The recipient trial-decrypts every blob with ivk and keeps the ones
@@ -123,12 +123,17 @@ func EncryptNoteWith(esk fr.Element, n *note.Note) [RecipientBlobSize]byte {
 	return blob
 }
 
+// KeystreamBytes is how many bytes each keystream element yields: its 31
+// low bytes. The top byte of a canonical element is biased (always below
+// 0x31), so it is dropped.
+const KeystreamBytes = fr.Bytes - 1
+
 func xorKeystream(buf []byte, key fr.Element) {
-	for i := 0; i*fr.Bytes < len(buf); i++ {
+	for i := 0; i*KeystreamBytes < len(buf); i++ {
 		k := keystream(key, uint64(i))
 		ks := k.Bytes()
-		for j := 0; j < fr.Bytes && i*fr.Bytes+j < len(buf); j++ {
-			buf[i*fr.Bytes+j] ^= ks[j]
+		for j := 0; j < KeystreamBytes && i*KeystreamBytes+j < len(buf); j++ {
+			buf[i*KeystreamBytes+j] ^= ks[1+j]
 		}
 	}
 }

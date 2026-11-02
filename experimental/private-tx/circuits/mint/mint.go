@@ -43,6 +43,7 @@ type Circuit struct {
 	PKD     gadgetted.Point
 	R       frontend.Variable
 	D       frontend.Variable
+	GDProof note.GroupHashVars
 	AuditPK gadgetted.Point
 	ESK     frontend.Variable
 	// EncHash binds the recipient blob: the program recomputes it from the
@@ -50,9 +51,9 @@ type Circuit struct {
 	EncHash frontend.Variable
 }
 
-// Define constrains value ∈ [0, 2^64), commitment = Poseidon(CM, value,
-// g_d, pk_d, r), and audit_hash over the note's audit ciphertext (package
-// encrypt) and the recipient blob's hash.
+// Define constrains value ∈ [0, 2^64), g_d = GroupHash(d), commitment =
+// Poseidon(CM, value, g_d, pk_d, r), and audit_hash over the note's audit
+// ciphertext (package encrypt) and the recipient blob's hash.
 //
 // The value is public, so the on-chain verifier already rejects a non-canonical
 // scalar; the bit decomposition still bounds it to 64 bits so every leaf in the
@@ -72,6 +73,11 @@ func (c *Circuit) Define(api frontend.API) error {
 		return err
 	}
 	api.ToBinary(c.D, note.DiversifierSize*8)
+	// g_d = GroupHash(d), so the audit ciphertext's d names the base the
+	// commitment was made with and the custodian can always recompute it.
+	if err := note.GroupHashGadget(api, curve, c.D, c.GDProof, c.GD); err != nil {
+		return err
+	}
 	note.AssertNotSmallOrder(curve, c.GD)
 	curve.AssertIsOnCurve(c.PKD)
 	cm, err := note.CommitmentGadget(api, c.Value, c.GD, c.PKD, c.R)
@@ -109,15 +115,19 @@ func Build(n *note.Note, apk *twistededwards.PointAffine, esk fr.Element, encBlo
 		AuditBlob:  encrypt.AuditBlob(&epk, cts),
 	}
 	st.AuditHash = encrypt.AuditHash(apk, &epk, cts, st.EncHash)
-	gd := n.GD()
+	gdw, err := n.D.GroupHashWitness()
+	if err != nil {
+		panic(err) // the note's g_d exists, so its witness does
+	}
 	return &Circuit{
 		Commitment: st.Commitment,
 		Value:      n.Value,
 		AuditHash:  st.AuditHash,
-		GD:         note.PointVars(&gd),
+		GD:         note.PointVars(&gdw.GD),
 		PKD:        note.PointVars(&n.PKD),
 		R:          n.R,
 		D:          n.D.Element(),
+		GDProof:    gdw.Vars(),
 		AuditPK:    note.PointVars(apk),
 		ESK:        esk,
 		EncHash:    st.EncHash,

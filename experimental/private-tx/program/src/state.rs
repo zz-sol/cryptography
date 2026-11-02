@@ -74,6 +74,11 @@ pub const NULLIFIER_ACCOUNT_LEN: usize = 1;
 pub const NULLIFIER_SEED: &[u8] = b"nullifier";
 /// Vault authority PDA seeds: `[VAULT_SEED, pool address]`.
 pub const VAULT_SEED: &[u8] = b"vault";
+/// The only token program a pool may be created over. Token-2022 is
+/// refused: a transfer-fee or transfer-hook extension would make the vault
+/// receive less than the note minted, breaking `supply == vault balance`.
+pub const TOKEN_PROGRAM_ID: Address =
+    Address::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 /// SPL Token account layout, the parts read here.
 pub mod token_account {

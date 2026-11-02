@@ -114,6 +114,12 @@ func TestLifecycle(t *testing.T) {
 		t.Fatalf("one-input transfer: %v", err)
 	}
 
+	// The same note twice is refused before proving.
+	if _, err := bob.Pay(rand.Reader, &ledger, pool, &custodian.PK, []Owned{bobs[0], bobs[0]},
+		[2]Payment{{To: bobAddr, Value: 5000}, {To: bobAddr, Value: 0}}); err == nil {
+		t.Fatal("double spend accepted")
+	}
+
 	// Payments must use the inputs up.
 	if _, err := bob.Pay(rand.Reader, &ledger, pool, &custodian.PK, bobs,
 		[2]Payment{{To: bobAddr, Value: 1}, {To: bobAddr, Value: 0}}); err == nil {

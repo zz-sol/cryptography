@@ -66,9 +66,11 @@ pub fn decrypt_note(ivk: &Fr, blob: &[u8], cm: &[u8; 32]) -> Option<Note> {
     let key = kdf(&epk.mul(ivk), &epk);
     let mut pt = [0u8; RECIPIENT_BLOB_LEN - 32];
     pt.copy_from_slice(&blob[32..]);
-    for (i, chunk) in pt.chunks_mut(32).enumerate() {
+    // 31 bytes per keystream element: the top byte of a canonical field
+    // element is biased, so it is dropped (`circuits/encrypt`).
+    for (i, chunk) in pt.chunks_mut(31).enumerate() {
         let ks = keystream(&key, i as u64);
-        for (b, k) in chunk.iter_mut().zip(ks.iter()) {
+        for (b, k) in chunk.iter_mut().zip(ks[1..].iter()) {
             *b ^= k;
         }
     }

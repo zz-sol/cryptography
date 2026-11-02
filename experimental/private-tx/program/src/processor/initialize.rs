@@ -10,7 +10,8 @@
 //! and `C_burn`; pinning them pins the circuits.
 //!
 //! The vault is created by the client too: an initialized token account of
-//! `token_mint` under `token program`, owned by the vault authority PDA
+//! `token_mint` under the classic SPL Token program (Token-2022 is refused,
+//! see [`TOKEN_PROGRAM_ID`]), owned by the vault authority PDA
 //! `["vault", pool]`. It is checked here and pinned, together with the
 //! token program, so later instructions only compare addresses.
 
@@ -18,7 +19,7 @@ use {
     super::{expect_owned_by, expect_signer, expect_writable, take},
     crate::{
         error::PoolError,
-        state::{token_account, Pool, POOL_ACCOUNT_LEN, VAULT_SEED},
+        state::{token_account, Pool, POOL_ACCOUNT_LEN, TOKEN_PROGRAM_ID, VAULT_SEED},
     },
     pinocchio::{error::ProgramError, AccountView, Address, ProgramResult},
 };
@@ -50,7 +51,10 @@ pub fn process(
     }
 
     // The vault: an initialized token account of the mint, owned by the
-    // vault authority PDA, under the given token program.
+    // vault authority PDA, under the classic SPL Token program only.
+    if token_program.address() != &TOKEN_PROGRAM_ID {
+        return Err(PoolError::WrongTokenProgram.into());
+    }
     if !token_program.executable() {
         return Err(ProgramError::IncorrectProgramId);
     }

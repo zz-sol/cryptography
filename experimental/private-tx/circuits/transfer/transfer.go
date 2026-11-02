@@ -9,8 +9,8 @@
 // well-formed owner, nullifier and signature, so every transaction has
 // the same shape whatever it spends.
 //
-// Each output is C_mint's note relation: a well-formed address, a 64-bit
-// value, the published commitment. Values are conserved exactly; there is
+// Each output is C_mint's note relation: a well-formed address with
+// g_d = GroupHash(d), a 64-bit value, the published commitment. Values are conserved exactly; there is
 // no fee or public value in this circuit.
 //
 // The outputs are encrypted to the custodian inside the circuit (package
@@ -83,10 +83,11 @@ type Circuit struct {
 	AuditHash   frontend.Variable `gnark:",public"`
 	SigHash     frontend.Variable `gnark:",public"`
 
-	Inputs  [NumInputs]InputVars
-	Outputs [NumOutputs]encrypt.OutputVars
-	AuditPK gadgetted.Point
-	ESK     frontend.Variable
+	Inputs   [NumInputs]InputVars
+	Outputs  [NumOutputs]encrypt.OutputVars
+	GDProofs [NumOutputs]note.GroupHashVars
+	AuditPK  gadgetted.Point
+	ESK      frontend.Variable
 }
 
 // Define constrains the relation described in the package comment.
@@ -143,6 +144,9 @@ func (c *Circuit) Define(api frontend.API) error {
 	for i, out := range c.Outputs {
 		api.ToBinary(out.Value, 64)
 		api.ToBinary(out.D, note.DiversifierSize*8)
+		if err := note.GroupHashGadget(api, curve, out.D, c.GDProofs[i], out.GD); err != nil {
+			return err
+		}
 		note.AssertNotSmallOrder(curve, out.GD)
 		curve.AssertIsOnCurve(out.PKD)
 		cm, err := note.CommitmentGadget(api, out.Value, out.GD, out.PKD, out.R)
@@ -283,6 +287,11 @@ func Build(p *Params) (*Circuit, *Statement, error) {
 	}
 	for i := range p.Outputs {
 		c.Outputs[i] = OutputVars(&p.Outputs[i])
+		gdw, err := p.Outputs[i].D.GroupHashWitness()
+		if err != nil {
+			return nil, nil, err
+		}
+		c.GDProofs[i] = gdw.Vars()
 	}
 	return c, &st, nil
 }

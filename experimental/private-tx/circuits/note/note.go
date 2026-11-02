@@ -11,7 +11,7 @@
 //	nk  = Poseidon(NK, sk)           nullifier key
 //	fvk = (ak, nk)                   full viewing key
 //	ivk = Poseidon(IVK, ak.x, ak.y, nk)   incoming viewing key, used as a scalar
-//	g_d = GroupHash(d)               diversifier base, d an 11-byte diversifier
+//	g_d = GroupHash(d)               diversifier base, d an 11-byte diversifier (replayed in-circuit)
 //	pk_d = [ivk]g_d                  diversified transmission key
 //	address = (d, pk_d)
 //
@@ -52,6 +52,7 @@ import (
 	"github.com/consensys/gnark-crypto/hash"
 	"github.com/consensys/gnark/frontend"
 	gadgetted "github.com/consensys/gnark/std/algebra/native/twistededwards"
+	"github.com/consensys/gnark/std/math/cmp"
 	gadgeteddsa "github.com/consensys/gnark/std/signature/eddsa"
 
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/domain"
@@ -71,29 +72,76 @@ func (d Diversifier) Element() fr.Element {
 	return e
 }
 
+// GroupHashTries bounds the try-and-increment of GroupHash, so the gadget
+// can replay it. A diversifier whose first curve point needs more tries is
+// unusable (probability 2^-8): pick another.
+const GroupHashTries = 8
+
+// NonResidue is a fixed quadratic non-residue of Fr (5), the witness of
+// "not a square": r is not a square iff NonResidue·r is.
+var NonResidue = fr.NewElement(5)
+
+// groupHashRHS is y² as a function of x on the curve:
+// a x² + y² = 1 + D x² y²  =>  y² = (1 - a x²) / (1 - D x²).
+func groupHashRHS(x fr.Element) (fr.Element, bool) {
+	params := twistededwards.GetEdwardsCurve()
+	one := fr.NewElement(1)
+	var xx, num, den, rhs fr.Element
+	xx.Square(&x)
+	num.Mul(&params.A, &xx)
+	num.Sub(&one, &num)
+	den.Mul(&params.D, &xx)
+	den.Sub(&one, &den)
+	if den.IsZero() {
+		return fr.Element{}, false
+	}
+	rhs.Div(&num, &den)
+	return rhs, true
+}
+
 // GroupHash maps the diversifier to g_d, a point of the prime-order
 // subgroup: x = Poseidon(GD, d, counter) for counter = 0, 1, ..., the first
 // x that is the abscissa of a curve point, with the smaller y, cleared of
-// the cofactor. Fails only if 256 counters give no point or the identity.
+// the cofactor. Fails if no counter below GroupHashTries gives a point.
 func (d Diversifier) GroupHash() (twistededwards.PointAffine, error) {
+	w, err := d.GroupHashWitness()
+	if err != nil {
+		return twistededwards.PointAffine{}, err
+	}
+	return w.GD, nil
+}
+
+// GroupHashWitness is GroupHash with everything the gadget replays: the
+// counter that hit, the point before cofactor clearing, and for every
+// counter before it a square root of NonResidue·rhs, which is what shows
+// that rhs was not a square.
+type GroupHashWitness struct {
+	Ctr   uint64
+	X, Y  fr.Element
+	Roots [GroupHashTries]fr.Element
+	GD    twistededwards.PointAffine
+}
+
+// GroupHashWitness runs the group hash and records the witness.
+func (d Diversifier) GroupHashWitness() (GroupHashWitness, error) {
 	params := twistededwards.GetEdwardsCurve()
+	var w GroupHashWitness
 	var ctr fr.Element
-	for i := 0; i < 256; i++ {
-		ctr.SetUint64(uint64(i))
+	for i := uint64(0); i < GroupHashTries; i++ {
+		ctr.SetUint64(i)
 		x := poseidon.MustHash(domain.Tag(domain.GD), d.Element(), ctr)
-		// a x² + y² = 1 + D x² y²  =>  y² = (1 - a x²) / (1 - D x²)
-		one := fr.NewElement(1)
-		var xx, num, den, y2, y fr.Element
-		xx.Square(&x)
-		num.Mul(&params.A, &xx)
-		num.Sub(&one, &num)
-		den.Mul(&params.D, &xx)
-		den.Sub(&one, &den)
-		if den.IsZero() {
-			continue
+		rhs, ok := groupHashRHS(x)
+		if !ok {
+			return w, fmt.Errorf("note: diversifier %x hits a pole at counter %d", d[:], i)
 		}
-		y2.Div(&num, &den)
-		if y.Sqrt(&y2) == nil {
+		var y fr.Element
+		if y.Sqrt(&rhs) == nil {
+			// Not a square: NonResidue·rhs is.
+			var nr fr.Element
+			nr.Mul(&NonResidue, &rhs)
+			if w.Roots[i].Sqrt(&nr) == nil {
+				panic("note: neither rhs nor NonResidue·rhs is a square")
+			}
 			continue
 		}
 		var negY fr.Element
@@ -104,11 +152,68 @@ func (d Diversifier) GroupHash() (twistededwards.PointAffine, error) {
 		p := twistededwards.PointAffine{X: x, Y: y}
 		p.ScalarMultiplication(&p, params.Cofactor.BigInt(new(big.Int)))
 		if p.IsZero() {
-			continue
+			return w, fmt.Errorf("note: diversifier %x gives a small-order point at counter %d", d[:], i)
 		}
-		return p, nil
+		w.Ctr, w.X, w.Y, w.GD = i, x, y, p
+		return w, nil
 	}
-	return twistededwards.PointAffine{}, fmt.Errorf("note: no group hash for diversifier %x", d[:])
+	return w, fmt.Errorf("note: no group hash for diversifier %x in %d tries", d[:], GroupHashTries)
+}
+
+// GroupHashVars is GroupHashWitness as circuit variables.
+type GroupHashVars struct {
+	Ctr   frontend.Variable
+	X, Y  frontend.Variable
+	Roots [GroupHashTries]frontend.Variable
+}
+
+// Vars converts the witness.
+func (w *GroupHashWitness) Vars() GroupHashVars {
+	v := GroupHashVars{Ctr: w.Ctr, X: w.X, Y: w.Y}
+	for i := range w.Roots {
+		v.Roots[i] = w.Roots[i]
+	}
+	return v
+}
+
+// GroupHashGadget constrains gd = GroupHash(d), replaying the
+// try-and-increment: for counters before the witness's, rhs is shown to be
+// a non-square by a root of NonResidue·rhs; at the witness's counter,
+// (x, y) is on the curve with y the smaller root; the counter is below
+// GroupHashTries; gd = [8](x, y). The caller range-checks d.
+func GroupHashGadget(api frontend.API, curve gadgetted.Curve, d frontend.Variable, w GroupHashVars, gd gadgetted.Point) error {
+	params := twistededwards.GetEdwardsCurve()
+	// lt_i = [i < ctr], eq_i = [i == ctr]; exactly one eq_i is 1.
+	var lt frontend.Variable = 1
+	var hits frontend.Variable = 0
+	for i := 0; i < GroupHashTries; i++ {
+		eq := api.IsZero(api.Sub(w.Ctr, i))
+		lt = api.Sub(lt, eq)
+		hits = api.Add(hits, eq)
+		x, err := poseidon.HashGadget(api, domain.Tag(domain.GD), d, i)
+		if err != nil {
+			return err
+		}
+		xx := api.Mul(x, x)
+		num := api.Sub(1, api.Mul(params.A, xx))
+		den := api.Sub(1, api.Mul(params.D, xx))
+		rhs := api.Div(num, den)
+		// i < ctr: root_i² = NonResidue · rhs_i.
+		api.AssertIsEqual(api.Mul(lt, api.Sub(api.Mul(w.Roots[i], w.Roots[i]), api.Mul(NonResidue, rhs))), 0)
+		// i == ctr: x = x_i and y² = rhs_i.
+		api.AssertIsEqual(api.Mul(eq, api.Sub(w.X, x)), 0)
+		api.AssertIsEqual(api.Mul(eq, api.Sub(api.Mul(w.Y, w.Y), rhs)), 0)
+	}
+	api.AssertIsEqual(hits, 1)
+	// y is the smaller root: y ≤ (r - 1) / 2.
+	half := new(big.Int).Rsh(fr.Modulus(), 1)
+	api.AssertIsEqual(cmp.IsLessOrEqual(api, w.Y, half), 1)
+	p := gadgetted.Point{X: w.X, Y: w.Y}
+	curve.AssertIsOnCurve(p)
+	q := curve.Double(curve.Double(curve.Double(p)))
+	api.AssertIsEqual(q.X, gd.X)
+	api.AssertIsEqual(q.Y, gd.Y)
+	return nil
 }
 
 // SpendingKey is sk with the keys derived from it.

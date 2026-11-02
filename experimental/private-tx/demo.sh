@@ -19,7 +19,7 @@ VERIFIER_SO=$DIR/target/groth16-verifier-program/target/deploy/solana_groth16_pr
 POOL_SO=$DIR/program/target/deploy/private_tx_pool.so
 VERIFIER_ID=GrPeAM83MtRfR8NvbW3tMMSBzQ9BsmQrgLjLCQNwZW4P
 POOL_ID=3sDoL7Tan84VmueUVRp1NRkhfPRF2z54ccf4J4LMHXdT
-RPC=http://127.0.0.1:8899
+RPC=${RPC:-http://127.0.0.1:8899}
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 field() { awk -v k="$1" '$1 == k { print $2 }'; }
@@ -34,14 +34,17 @@ mkdir -p "$WORK"
 PRIVTX="$WORK/privtx"
 CLI="$DIR/cli/target/release/privtx-cli --url $RPC --keypair $WORK/payer.json"
 
-if [ ! -f "$WORK/keys/transfer.pk" ]; then
-  step "Groth16 setup (development keys, once)"
-  "$PRIVTX" setup -keys "$WORK/keys" 2>&1 | grep -v DBG
-fi
+# Always: the development setup takes seconds, and keys made for an older
+# version of a circuit are refused by the prover.
+step "Groth16 setup (development keys)"
+"$PRIVTX" setup -keys "$WORK/keys" 2>&1 | grep -v DBG
 
 # ------------------------------------------------------------ validator
 step "Starting a local validator with the verifier and pool programs"
-pkill -f solana-test-validator >/dev/null 2>&1 || true
+if solana cluster-version -u "$RPC" >/dev/null 2>&1; then
+  echo "something already answers on $RPC; stop it or set RPC to a free port" >&2
+  exit 1
+fi
 rm -rf "$WORK/ledger"
 solana-test-validator --reset --quiet --ledger "$WORK/ledger" \
   --bpf-program "$VERIFIER_ID" "$VERIFIER_SO" \

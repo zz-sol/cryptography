@@ -18,7 +18,7 @@ import (
 
 // NbConstraints is the R1CS size of the circuit as compiled by the pinned gnark
 // and Poseidon gadget versions; quoted in README.md.
-const NbConstraints = 53378
+const NbConstraints = 59234
 
 var testPool = [32]byte{7, 7, 7}
 
