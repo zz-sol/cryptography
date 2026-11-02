@@ -39,10 +39,15 @@ pub struct Groth16Fixture {
 
 /// Parses and converts `vk.bin`, `proof.bin`, `public.bin`.
 pub fn load_groth16(fixture: &str) -> Groth16Fixture {
-    let key = gnark::parse_verifying_key(&read_fixture(fixture, "vk.bin")).expect("vk.bin");
-    let proof = gnark::parse_proof(&read_fixture(fixture, "proof.bin")).expect("proof.bin");
-    let inputs =
-        gnark::parse_public_witness(&read_fixture(fixture, "public.bin")).expect("public.bin");
+    load_groth16_files(fixture, "vk.bin", "proof.bin", "public.bin")
+}
+
+/// Parses and converts a key, proof and public witness by file name under
+/// `<fixture>/`, for fixtures holding several proofs of one key.
+pub fn load_groth16_files(fixture: &str, vk: &str, proof: &str, public: &str) -> Groth16Fixture {
+    let key = gnark::parse_verifying_key(&read_fixture(fixture, vk)).expect(vk);
+    let proof = gnark::parse_proof(&read_fixture(fixture, proof)).expect(proof);
+    let inputs = gnark::parse_public_witness(&read_fixture(fixture, public)).expect(public);
     Groth16Fixture {
         key,
         proof,
@@ -168,6 +173,62 @@ impl BurnFixture {
     /// The tree root recomputed from the leaves.
     pub fn poseidon_root(&self) -> [u8; 32] {
         let leaves: Vec<Fr> = self.leaves.iter().map(|l| fr_from_hex(l)).collect();
+        merkle_root(&leaves, self.depth)
+    }
+}
+
+/// The pool fixture (`pool.json`), as written by `privtx pool-fixture`: the
+/// notes in leaf order, the root once all are minted, and the burns proved
+/// against that root. Proofs live in `mint/` (one per note, sharing
+/// `mint/vk.bin`) and `burn/` (one per burn, sharing `burn/vk.bin`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoolFixture {
+    pub depth: usize,
+    pub notes: Vec<NoteOpening>,
+    pub root: String,
+    pub burns: Vec<PoolBurn>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoolBurn {
+    pub name: String,
+    pub index: u64,
+    pub nullifier: String,
+    pub forced: bool,
+}
+
+impl PoolFixture {
+    pub fn load(fixture: &str) -> Self {
+        serde_json::from_slice(&read_fixture(fixture, "pool.json")).expect("pool.json")
+    }
+
+    /// The `C_mint` proof of note `i`.
+    pub fn mint_proof(&self, fixture: &str, i: usize) -> Groth16Fixture {
+        load_groth16_files(
+            fixture,
+            "mint/vk.bin",
+            &format!("mint/proof-{i}.bin"),
+            &format!("mint/public-{i}.bin"),
+        )
+    }
+
+    /// The `C_burn` proof named by `burn.name`.
+    pub fn burn_proof(&self, fixture: &str, burn: &PoolBurn) -> Groth16Fixture {
+        load_groth16_files(
+            fixture,
+            "burn/vk.bin",
+            &format!("burn/proof-{}.bin", burn.name),
+            &format!("burn/public-{}.bin", burn.name),
+        )
+    }
+
+    /// The tree root recomputed from the notes' commitments.
+    pub fn poseidon_root(&self) -> [u8; 32] {
+        let leaves: Vec<Fr> = self
+            .notes
+            .iter()
+            .map(|n| fr_from_hex(&n.commitment))
+            .collect();
         merkle_root(&leaves, self.depth)
     }
 }

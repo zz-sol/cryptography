@@ -38,7 +38,7 @@ dependencies = [
  "solana-instruction",
  "solana-keccak-hasher",
  "solana-loader-v3-interface",
- "solana-poseidon",
+ "solana-poseidon 4.0.0",
  "solana-program-entrypoint",
  "solana-program-runtime",
  "solana-pubkey 4.1.0",
@@ -2079,7 +2079,18 @@ dependencies = [
  "solana-account-view",
  "solana-address 2.9.0",
  "solana-define-syscall 5.2.0",
+ "solana-instruction-view",
  "solana-program-error",
+]
+
+[[package]]
+name = "pinocchio-system"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ae2ee67b42e2ac797dd88312da473c895660e270d8093e0ba2749b885b5778"
+dependencies = [
+ "pinocchio",
+ "solana-address 2.9.0",
 ]
 
 [[package]]
@@ -2132,6 +2143,7 @@ dependencies = [
  "hex",
  "light-poseidon 0.4.1",
  "mollusk-svm",
+ "private-tx-pool",
  "serde",
  "serde_json",
  "solana-account",
@@ -2139,6 +2151,18 @@ dependencies = [
  "solana-groth16-verify",
  "solana-instruction",
  "solana-program-error",
+]
+
+[[package]]
+name = "private-tx-pool"
+version = "0.0.0"
+dependencies = [
+ "pinocchio",
+ "pinocchio-system",
+ "solana-address 2.9.0",
+ "solana-groth16-verify",
+ "solana-instruction",
+ "solana-poseidon 5.0.1",
 ]
 
 [[package]]
@@ -2982,6 +3006,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-instruction-view"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ab7a27d0c4214b9f7389c3dd00b68c93093a67f1dcc5b7893aebe299bbcbb47"
+dependencies = [
+ "solana-account-view",
+ "solana-address 2.9.0",
+ "solana-define-syscall 5.2.0",
+ "solana-program-error",
+]
+
+[[package]]
 name = "solana-instructions-sysvar"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3137,6 +3173,18 @@ dependencies = [
  "light-poseidon 0.2.0",
  "light-poseidon 0.4.1",
  "solana-define-syscall 4.0.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "solana-poseidon"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a066cf8c003a052ee6cab5e639174b4ddb395d38816dc6fb33d1b86fd2cd13a"
+dependencies = [
+ "ark-bn254 0.5.0",
+ "light-poseidon 0.4.1",
+ "solana-define-syscall 5.2.0",
  "thiserror 2.0.21",
 ]
 

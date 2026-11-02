@@ -7,8 +7,10 @@ Tracker: [anza-xyz/cryptography#123](https://github.com/anza-xyz/cryptography/is
 
 Status: milestone 1. The framework (Go module, Poseidon library choice,
 fixture tooling, Rust end-to-end harness against the verifier program, CI) is
-in place and `C_mint` and `C_burn` are implemented; their proofs verify
-through the verifier program under Mollusk.
+in place, `C_mint` and `C_burn` are implemented, and a first pool program
+consumes their proofs: under Mollusk, a pool is created, notes are minted
+into its on-chain commitment tree through verified proofs, and burned by
+their owner or forfeited by the custodian, with the nullifier recorded.
 
 ## Layout
 
@@ -24,7 +26,9 @@ through the verifier program under Mollusk.
 | `circuits/export/` | writes gnark's native `vk.bin` / `proof.bin` / `public.bin` |
 | `circuits/cmd/privtx/` | `privtx <circuit>-fixture`: setup, prove, export |
 | `fixtures/<circuit>/` | a key, proof and public witness per circuit, consumed by `e2e/` |
-| `e2e/` | Rust crate (its own workspace, not a member of the repository root): fixture → on-chain format → verifier host path and SBF program |
+| `fixtures/pool/` | a whole pool lifecycle: one `C_mint` proof per note and two `C_burn` proofs against the resulting tree |
+| `program/` | Rust crate (own workspace): the pool program, Pinocchio SBF, with host-side instruction builders behind the `instruction` feature |
+| `e2e/` | Rust crate (own workspace): fixture → on-chain format → verifier host path, verifier SBF program, and the pool program under Mollusk |
 
 ## Poseidon
 
@@ -161,6 +165,51 @@ opening (`owner_pk`, `rho`, `r`), not only the value, for forfeiture to work;
 and the statement should bind where the released amount goes, so a proof
 cannot be replayed from the mempool with another recipient.
 
+## Pool program
+
+`program/` is one shielded pool as a Solana program, written with Pinocchio
+like the verifier. It holds no proof logic: every `Mint` and `Burn` CPIs the
+Groth16 verifier program's `Verify` with the circuit's content-addressed
+verifying-key account, whose address the pool pins at initialization. The
+program decides which public inputs the proof must open to and what to do
+with them.
+
+One pool account (4,256 bytes):
+
+| field | what |
+| --- | --- |
+| `custodian`, `issuer` | signers of forced burns and of mints |
+| `mint_key`, `burn_key` | the verifier key accounts of `C_mint` and `C_burn` |
+| `supply` | minted minus burned |
+| `next_index`, `filled[32]`, `zeros[32]` | the incremental Merkle tree (depth 32, `Poseidon(left, right)` via `sol_poseidon`), the same tree `circuits/merkle` defines |
+| `roots[64]` | ring of recent roots a burn may prove against |
+
+Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
+`Burn`; a second burn of the same note fails because the account exists.
+
+| instruction | accounts | data | effect |
+| --- | --- | --- | --- |
+| `InitializePool` | pool (s, w) | custodian, issuer, mint_key, burn_key | fills the empty tree (32 Poseidon calls), pushes the empty root |
+| `Mint` | pool (w), issuer (s), verifier, mint key | proof, commitment, value | verify `(commitment, value)`; append; `supply += value` |
+| `Burn` | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced) | proof, root, nullifier, value, forced | root ∈ history; verify `(root, nullifier, value, forced)`; create the PDA; `supply -= value` |
+
+Compute units under Mollusk (SBF v2, local): `InitializePool` 27.7k; `Mint`
+112k, of which 82.8k is the verifier CPI and the rest is mostly the 32
+Poseidon syscalls of the append; `Burn` 91.6k (unshield) / 93.5k (forfeit).
+
+What it does not do yet, all spec items: no vault, so `Mint` and `Burn`
+only move the supply counter and the token boundary (deposit on mint,
+withdrawal on burn) is missing; the burn statement does not bind where the
+released amount goes, so a proof could be replayed from the mempool with
+another payer; the program id is a placeholder.
+
+The e2e test `e2e/tests/pool.rs` replays `fixtures/pool/`: it registers both
+keys, creates a pool, mints every note and checks the on-chain root against
+the fixture's and against a light-poseidon tree over the same leaves, then
+burns one note as its owner and forfeits another as the custodian, and
+checks every rejection (replayed nullifier, unknown root, forfeiture without
+the custodian, tampered public inputs, wrong key, wrong PDA).
+
 ## Circuit rules
 
 - Plain Groth16 only. No `std/rangecheck` or anything else built on
@@ -179,22 +228,23 @@ make lint           # gofmt + go vet; cargo fmt + clippy for e2e
 make test-go        # Go: Poseidon vectors, gadget == native, Merkle tree, C_mint / C_burn prove/verify
 make test-e2e       # Rust (release): host-path verification of the fixtures
 make verifier-sbf   # clone + build the verifier program (needs cargo build-sbf 4.1+ for SBF v3; SBF_ARCH=v2 for older)
-make test-e2e       # now also verifies the proofs inside the SBF program
+make pool-sbf       # build the pool program
+make test-e2e       # now also verifies the proofs inside the SBF program and runs the pool lifecycle
 make fixtures       # regenerate fixtures (random setup: bytes change)
 ```
 
-The e2e crate is a standalone Cargo workspace: Mollusk brings in the SVM
-runtime, which would otherwise bloat the root lockfile and every build in the
-repository. It pins the verifier repository to one git revision (in
-`e2e/Cargo.toml` and the `Makefile`); the fixture encodings
-are gnark's native `WriteTo` / `MarshalBinary` forms, which that revision's
+The e2e and program crates are standalone Cargo workspaces: Mollusk brings
+in the SVM runtime, which would otherwise bloat the root lockfile and every
+build in the repository. Both pin the verifier repository to one git revision
+(in their `Cargo.toml` and the `Makefile`); the fixture encodings are gnark's
+native `WriteTo` / `MarshalBinary` forms, which that revision's
 `groth16-convert` parses. The Groth16 setup in `privtx` is for development
 only.
 
 CI (`.github/workflows/private-tx.yml`, run only when this directory or the
-workflow changes) lints and tests the Go side, builds the verifier program at
-the pinned revision, regenerates the fixtures, and runs the e2e crate with the
-SBF test enabled.
+workflow changes) lints and tests the Go side, builds the verifier and pool
+programs, regenerates the fixtures, and runs the e2e crate with the SBF
+tests enabled.
 
 ## Dependency pins
 
@@ -207,6 +257,12 @@ no tag newer than the required commit, so it stays on that commit.
 ## Next
 
 - `C_transfer`: spend side = `C_burn` with `forced = 0`; 2-in/2-out
-  conservation, auditor ciphertexts (Baby Jubjub ElGamal gadget).
-- Key hierarchy and domain separation of the Poseidon uses in the spec.
-- Pool program and client glue (Epic 4).
+  conservation, auditor ciphertexts (Baby Jubjub ElGamal gadget), and note
+  encryption to the recipient, without which a transfer cannot be received.
+- Key hierarchy, domain separation of the Poseidon uses, and destination
+  binding of `C_burn` in the spec; these change public inputs, so they come
+  before the pool program grows.
+- Pool program: vault (token boundary), `Transfer` once `C_transfer` exists,
+  a real program id.
+- Client glue: Merkle path tracking from chain state, proving, transaction
+  assembly (Epic 4).

@@ -1,0 +1,55 @@
+{
+  "depth": 32,
+  "notes": [
+    {
+      "value": 1000000,
+      "owner_pk": "0x246efd92c2d2339f4a41f3a5f268db56c0a4c573b5e7b8560ae8f12052b4edc5",
+      "rho": "0x03e5a5e938a2f56c8306b26d5125da9af095b0079a09da8d888c684f4e3d81aa",
+      "r": "0x0df20ded14577b5e267bbcffc02c7286ce0a3105e337bc8afe45f2aed16ebc38",
+      "commitment": "0x08cb6e22cbde49038c2361fb35b465453d2466cb0c8657351f28b23dd6ffe623"
+    },
+    {
+      "value": 2000000,
+      "owner_pk": "0x06b9f3fc8f5dec28fdf5ee62334074bb776645aaabad0ba0363afdf84d1804a4",
+      "rho": "0x07bf9ac79b2d0728782de8ad63b44990f7b5096a8d07b05b695fa981721eaf74",
+      "r": "0x1ac25424899bf343df10526893fec122dc3ed6acb5bbeb1ce50151cfcefc0f38",
+      "commitment": "0x1ca37ec6d397da185242fdda3afce37115be9c9866ccc85751b5dd189d06cf7d"
+    },
+    {
+      "value": 3000000,
+      "owner_pk": "0x285a2f4eaa3f7c0425f1358fff86e8539992a6f488a773edef220be35d02af26",
+      "rho": "0x2412cba43b88d8e4d5eb760baf3a9ae26aa1f177f7dd7d0786d13e7b2f450bb8",
+      "r": "0x2c22abddba58ee0c5acaa2b31db132f787d3c9a1af5ab7602fbdbe1ba9e046e6",
+      "commitment": "0x14a0986e00ea2abbb74069ba0a2c410f1e8a49c2339f48518649511f9040269a"
+    },
+    {
+      "value": 4000000,
+      "owner_pk": "0x1add1d6793168460bb3131f8a7490e33a02620923f49497168dd2b86a7d926f4",
+      "rho": "0x2267c6af1e3bff0796037653b17987c428115777ec4d9520bbc85aa717764c8b",
+      "r": "0x1fd083672e4798ffe450f576bcdd2666970475766a2ee68140f0d71fcbe461d5",
+      "commitment": "0x22a4824fe20909c8bde054807979863aef75d57d61a133498f6595d73efd2b1b"
+    },
+    {
+      "value": 5000000,
+      "owner_pk": "0x10e9f12e6aab4a5882ab1d9f5900489a216cdf89a9b4cab65719cf80928f2449",
+      "rho": "0x01561c9d3d10481c45bb8cf24693d29cf9f839ea86c0fb1685e454aadc3f7de3",
+      "r": "0x0f038dd93fe04873223f37ef4c401c88ed95451ada485ff84d11e5be6fb04422",
+      "commitment": "0x1f6d9af153f0f665ad6233c479e82673b1dee14edc9ad987cfe2ba55f974c772"
+    }
+  ],
+  "root": "0x27b9d9c8a820676e36bb12327038d129bd6d4b5faacba482582aa4a230078976",
+  "burns": [
+    {
+      "name": "unshield",
+      "index": 2,
+      "nullifier": "0x2e171c7d040c492efdeb74ee7f8d445f788e5ef059059931faa710f48da54113",
+      "forced": false
+    },
+    {
+      "name": "forfeit",
+      "index": 4,
+      "nullifier": "0x2c4533c9afc398f5d57a339bafd1c5c3d312a1e566588567f43c961358a067d6",
+      "forced": true
+    }
+  ]
+}
