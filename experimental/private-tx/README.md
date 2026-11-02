@@ -5,12 +5,14 @@ commitments, gnark circuits, verified on-chain by the generic
 [Groth16 verifier program](https://github.com/solana-program/groth16-verifier-program).
 Tracker: [anza-xyz/cryptography#123](https://github.com/anza-xyz/cryptography/issues/123).
 
-Status: milestone 1. The framework (Go module, Poseidon library choice,
-fixture tooling, Rust end-to-end harness against the verifier program, CI) is
-in place, `C_mint` and `C_burn` are implemented, and a first pool program
-consumes their proofs: under Mollusk, a pool is created, notes are minted
-into its on-chain commitment tree through verified proofs, and burned by
-their owner or forfeited by the custodian, with the nullifier recorded.
+Status: the single-pool protocol runs end to end. `C_mint`, `C_transfer`
+and `C_burn` are implemented with note encryption to recipients and to the
+custodian's audit key; the pool program consumes their proofs over an SPL
+Token vault; and under Mollusk a whole lifecycle goes through: five shields
+to Alice, one transfer paying Bob with change, an unshield, a forfeiture
+and Bob's unshield, with an indexer rebuilding the pool from the
+instructions, the wallets finding their notes by trial decryption, and the
+custodian reading every output.
 
 ## Layout
 
@@ -21,14 +23,18 @@ their owner or forfeited by the custodian, with the nullifier recorded.
 | `circuits/smoke/` | trivial `A·B = C` circuit that exercises the pipeline end to end |
 | `circuits/note/` | note format, commitment and nullifier |
 | `circuits/merkle/` | commitment tree: native tree and membership gadget |
+| `circuits/domain/` | Poseidon domain tags |
+| `circuits/encrypt/` | note encryption to the recipient (off-circuit) and to the audit key (gadget + native) |
 | `circuits/mint/` | `C_mint` |
+| `circuits/transfer/` | `C_transfer` (2-in/2-out) |
 | `circuits/burn/` | `C_burn` (owner unshield and custodian forfeiture) |
+| `circuits/client/` | wallet side: ledger, scanning, witness building, proving |
 | `circuits/export/` | writes gnark's native `vk.bin` / `proof.bin` / `public.bin` |
 | `circuits/cmd/privtx/` | `privtx <circuit>-fixture`: setup, prove, export |
 | `fixtures/<circuit>/` | a key, proof and public witness per circuit, consumed by `e2e/` |
-| `fixtures/pool/` | a whole pool lifecycle: one `C_mint` proof per note and two `C_burn` proofs against the resulting tree |
+| `fixtures/pool/` | a whole pool lifecycle: shields, a transfer and burns with their ciphertexts, built through `client/` |
 | `program/` | Rust crate (own workspace): the pool program, Pinocchio SBF, with host-side instruction builders behind the `instruction` feature |
-| `e2e/` | Rust crate (own workspace): fixture → on-chain format → verifier host path, verifier SBF program, and the pool program under Mollusk |
+| `e2e/` | Rust crate (own workspace): fixture → on-chain format → verifier host path, verifier SBF program, the pool program under Mollusk; plus the indexer and wallet decryption (`curve`, `encrypt`, `indexer`) |
 
 ## Poseidon
 
@@ -102,9 +108,45 @@ nf   = Poseidon(NF, nk, cm, leaf index)                         // width 5
 
 Every Poseidon call is domain-separated: its first input is a constant tag,
 the ASCII of a short name (`privtx/cm`, `privtx/nf`, `privtx/nk`,
-`privtx/ask`, `privtx/ivk`, `privtx/gd`, `privtx/node`, `privtx/sighash`)
-read as a big-endian integer. `circuits/domain/` lists them; the pool
-program and the e2e crate spell the same strings.
+`privtx/ask`, `privtx/ivk`, `privtx/gd`, `privtx/node`, `privtx/sighash`,
+`privtx/tsighash`, `privtx/kdf`, `privtx/enc`, `privtx/audit`,
+`privtx/ench`) read as a big-endian integer. `circuits/domain/` lists them;
+the pool program and the e2e crate spell the same strings.
+
+## Note encryption
+
+Every output note travels with two ciphertexts, Sapling's construction with
+Poseidon in place of BLAKE2b and ChaCha20 (`circuits/encrypt/`).
+
+To the recipient, off-circuit, 83 bytes:
+
+```
+esk random;  epk = [esk]·g_d;  ss = [esk]·pk_d = [ivk]·epk
+key  = Poseidon(KDF, ss.x, ss.y, epk.x, epk.y);  ks_i = Poseidon(ENC, key, i)
+blob = epk (compressed, 32) ‖ (value LE 8 ‖ d 11 ‖ r 32) ⊕ (ks_0 ‖ ks_1)[0:51]
+```
+
+A wallet trial-decrypts every blob with `ivk`, derives `pk_d` from `d`,
+recommits, and keeps the notes whose commitment is the leaf's: that check
+is the integrity check, as in Sapling, so there is no MAC. Nothing forces
+a sender to encrypt honestly; a garbage blob costs them the payment.
+
+To the custodian, inside the circuit, three field elements per note:
+
+```
+esk random, one per transaction;  epk = [esk]·G;  ss = [esk]·apk = [ask]·epk
+key = Poseidon(KDF, ss.x, ss.y, epk.x, epk.y)
+per note:  (packed, pk_d.y, r) + Poseidon(ENC, key, i),  packed = lsb(pk_d.x)·2^152 + value·2^88 + d
+audit_hash = Poseidon(AUDIT, apk.x, apk.y, epk.x, epk.y, c_0, ..., extra...)
+```
+
+`C_mint` and `C_transfer` compute the ciphertext from the very notes they
+commit to and publish `audit_hash`; the program recomputes it from the
+blob in the instruction and the pool's audit key. So the custodian can
+read every note's full opening, which forfeiture needs, and a sender
+cannot put anything else there. Recipient blobs are bound too: their hash
+`enc_hash = Poseidon(ENCH, 31-byte chunks)` enters the mint's `audit_hash`
+and the transfer's sighash, so a transaction cannot be altered in flight.
 
 ## Commitment tree
 
@@ -132,10 +174,10 @@ pool program's business (issuer authority), not the circuit's.
 
 | | |
 | --- | --- |
-| public inputs | `commitment`, `value` (in that order) |
-| witness | `g_d`, `pk_d`, `r` |
-| constraints | `value ∈ [0, 2^64)` by bit decomposition; `g_d` on the curve and not of small order, `pk_d` on the curve; `commitment = Poseidon(CM, value, g_d, pk_d, r)` |
-| size | 468 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+| public inputs | `commitment`, `value`, `audit_hash` (in that order) |
+| witness | `g_d`, `pk_d`, `r`, `d`, `apk`, `esk`, `enc_hash` |
+| constraints | `value ∈ [0, 2^64)` by bit decomposition; `d < 2^88`; `g_d` on the curve and not of small order, `pk_d` on the curve; `commitment = Poseidon(CM, value, g_d, pk_d, r)`; `audit_hash` over the note's audit ciphertext and `enc_hash` |
+| size | 9659 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
 
 A confidential-issuance variant (hidden amount) is the same circuit with
 `Value` moved to the private witness. The point checks are Sapling's
@@ -149,6 +191,31 @@ does in the clear. Membership in the tree is proved when a note is spent, by
 `C_transfer` and `C_burn`. The nullifier set is untouched because a mint
 spends nothing. The on-chain mint flow is therefore: verify the proof,
 check issuer authority, add `value` to minted supply, append `commitment`.
+
+## C_transfer
+
+An in-pool shielded transfer of fixed arity: two notes in, two out
+(`circuits/transfer/`). Each input is `C_burn`'s spend relation (owner,
+membership, nullifier, signature over the sighash); each output is
+`C_mint`'s note relation; values are conserved exactly, with no fee or
+public value. A zero-value input is a dummy, as in Sapling: its root check
+is skipped (the note is in no tree) but it still carries a well-formed
+owner, nullifier and signature, so every transaction has the same shape.
+
+| | |
+| --- | --- |
+| public inputs | `root`, `nf_0`, `nf_1`, `cm_0`, `cm_1`, `audit_hash`, `sighash` (in that order) |
+| witness | per input: `ak`, `nk`, `g_d`, `pk_d`, `r`, `value`, leaf index, 32 siblings, signature; per output: `g_d`, `pk_d`, `r`, `value`, `d`; `apk`, `esk` |
+| constraints | per input: owner relation, `(root_i − root)·(1 − [value_i = 0]) = 0`, nullifier, `EdDSA.Verify(ak_i, sighash)`; per output: `value < 2^64`, `d < 2^88`, point checks, commitment; `Σ in = Σ out`; `audit_hash` over both outputs |
+| size | 53378 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+
+```
+sighash = Poseidon(TSIGHASH, pool[0:16], pool[16:32], nf_0, nf_1, cm_0, cm_1, audit_hash, enc_hash)
+```
+
+Both owners sign it, so consent covers every byte of the transaction. The
+circuit itself allows the same note as both inputs (equal nullifiers); the
+program rejects that, as Zcash's consensus rules do.
 
 ## C_burn
 
@@ -232,13 +299,15 @@ proof must open to and what to do with them: move tokens between the
 depositor, the vault and the destination, append to the tree, record the
 nullifier.
 
-One pool account (4,352 bytes):
+One pool account (4,448 bytes):
 
 | field | what |
 | --- | --- |
 | `custodian`, `issuer` | signers of forced burns and of mints |
 | `mint_key`, `burn_key` | the verifier key accounts of `C_mint` and `C_burn` |
+| `transfer_key` | the verifier key account of `C_transfer` |
 | `token_program`, `token_mint`, `vault` | the asset and the token account holding its backing, owned by the vault authority PDA `["vault", pool]` |
+| `audit_pk` | the custodian's audit key; every output's audit ciphertext is checked against it |
 | `supply` | minted minus burned; equals the vault balance |
 | `next_index`, `filled[32]`, `zeros[32]` | the incremental Merkle tree (depth 32, `Poseidon(NODE, left, right)` via `sol_poseidon`), the same tree `circuits/merkle` defines |
 | `roots[64]` | ring of recent roots a burn may prove against |
@@ -248,8 +317,9 @@ Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
 
 | instruction | accounts | data | effect |
 | --- | --- | --- | --- |
-| `InitializePool` | pool (s, w), vault, token program | custodian, issuer, mint_key, burn_key, token_mint | checks the vault is an initialized token account of the mint owned by the vault authority; fills the empty tree (32 Poseidon calls), pushes the empty root |
-| `Mint` (shield) | pool (w), issuer (s), verifier, mint key, source token account (w), source owner (s), vault (w), token program | proof, commitment, value | verify `(commitment, value)`; transfer `value` source → vault (source owner's authority); append; `supply += value` |
+| `InitializePool` | pool (s, w), vault, token program | custodian, issuer, mint_key, burn_key, transfer_key, token_mint, audit_pk | checks the vault is an initialized token account of the mint owned by the vault authority; fills the empty tree (32 Poseidon calls), pushes the empty root |
+| `Mint` (shield) | pool (w), issuer (s), verifier, mint key, source token account (w), source owner (s), vault (w), token program | proof, commitment, value, audit blob (160), recipient blob (83) | `audit_hash` from the blobs and `audit_pk`; verify `(commitment, value, audit_hash)`; transfer `value` source → vault (source owner's authority); append; `supply += value` |
+| `Transfer` | pool (w), payer (s, w), nullifier PDA 0 (w), nullifier PDA 1 (w), system, verifier, transfer key | proof, root, nf_0, nf_1, cm_0, cm_1, audit blob (256), recipient blobs (166) | root ∈ history; `nf_0 ≠ nf_1`; `audit_hash`, `enc_hash`, `sighash` from the data; verify `(root, nf_0, nf_1, cm_0, cm_1, audit_hash, sighash)`; create both PDAs; append both |
 | `Burn` (unshield / forfeit) | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced), vault (w), destination token account (w), vault authority, token program | proof, root, nullifier, value, forced | root ∈ history; `sighash = Poseidon(SIGHASH, pool, destination, nullifier, value)` with the destination account's address; verify `(root, nullifier, value, forced, sighash)`; create the PDA; transfer `value` vault → destination (PDA authority); `supply -= value` |
 
 The destination of a burn is a token account named in the instruction, and
@@ -260,25 +330,47 @@ and the deposit itself is the depositor's own token transfer, so the issuer
 cannot shield someone else's funds.
 
 Compute units under Mollusk (SBF v2, local): `InitializePool` 39.3k; `Mint`
-123k, of which 82.8k is the verifier CPI and the rest is mostly the 32
-Poseidon syscalls of the append plus the token transfer; `Burn` 103k
-(unshield or forfeit), five public inputs plus the sighash syscall and the
-token transfer.
+135k (verifier CPI, 32 Poseidon syscalls for the append, two wide Poseidon
+syscalls for the hashes, the token transfer); `Transfer` 206k (seven public
+inputs, 64 Poseidon syscalls for two appends, three wide ones for the
+hashes, two PDA creations); `Burn` 103k (unshield or forfeit). A `Transfer`
+instruction is 839 bytes of data, which with seven accounts fits a legacy
+transaction.
 
-What it does not do yet: `Transfer` (waits for `C_transfer`); Token-2022
-extensions are untested (the layout check and `Transfer` are the same, but
-transfer fees or hooks would break the supply/vault equality); the program
-id is a placeholder.
+What it does not do yet: Token-2022 extensions are untested (the layout
+check and `Transfer` are the same, but transfer fees or hooks would break
+the supply/vault equality); the program id is a placeholder; nothing is
+emitted for indexers beyond the instruction data itself.
 
-The e2e test `e2e/tests/pool.rs` replays `fixtures/pool/`: it registers both
-keys, creates a pool, mints every note and checks the on-chain root against
-the fixture's and against a light-poseidon tree over the same leaves, then
-burns one note as its owner and forfeits another as the custodian, with
-the vault and the destination token account's balances checked after every
-step, and checks every rejection (replayed nullifier, unknown root,
-forfeiture without the custodian, the same proof with another destination,
-wrong vault or token program, a depositor who cannot cover the note,
-tampered public inputs, wrong key, wrong PDA).
+## Client
+
+`circuits/client/` is the wallet side in Go: a `Ledger` (leaves with their
+recipient blobs, nullifiers seen) rebuilt from the chain, a `Wallet` that
+scans it by trial decryption and builds shields, transfers (padding with a
+dummy input, paying change as just another output) and unshields, a
+`Forfeit` builder for the custodian, and a `Prover`. `privtx pool-fixture`
+drives a whole lifecycle through it.
+
+The Rust side of the same in `e2e/src/`: `curve` (the embedded curve,
+compressed points, the group hash), `encrypt` (recipient and audit
+decryption, the hashes the program recomputes) and `indexer` (an `Indexer`
+that reads `Mint`, `Transfer` and `Burn` instructions as an indexer would
+read transaction history, rebuilds the tree and any leaf's Merkle path; a
+`Wallet` that scans it with `ivk` and `nk`). Proving stays in Go.
+
+The e2e test `e2e/tests/pool.rs` replays `fixtures/pool/`: it registers
+the three keys, creates a pool over a token mint with a vault and the
+custodian's audit key, shields every note, lets Alice's and Bob's wallets
+scan the indexed instructions (Alice finds five notes, Bob none), runs the
+transfer (Alice then sees three notes and her change, Bob his payment, the
+custodian decrypts both outputs from the audit blob), checks the rebuilt
+Merkle path of the note Alice unshields against the one the prover used,
+and runs the three burns with the vault and destination balances checked
+after every step. Every rejection is covered: replayed or duplicate
+nullifier, unknown root, forfeiture without the custodian, the same proof
+with another destination, tampered ciphertexts, wrong vault or token
+program, a depositor who cannot cover the note, tampered public inputs,
+wrong key, wrong PDA.
 
 ## Circuit rules
 
@@ -295,7 +387,7 @@ tampered public inputs, wrong key, wrong PDA).
 
 ```bash
 make lint           # gofmt + go vet; cargo fmt + clippy for e2e
-make test-go        # Go: Poseidon vectors, gadget == native, Merkle tree, C_mint / C_burn prove/verify
+make test-go        # Go: Poseidon vectors, gadget == native, Merkle tree, encryption, circuits, client lifecycle
 make test-e2e       # Rust (release): host-path verification of the fixtures
 make verifier-sbf   # clone + build the verifier program (needs cargo build-sbf 4.1+ for SBF v3; SBF_ARCH=v2 for older)
 make pool-sbf       # build the pool program
@@ -326,13 +418,14 @@ no tag newer than the required commit, so it stays on that commit.
 
 ## Next
 
-- `C_transfer`: spend side = `C_burn` with `forced = 0`; 2-in/2-out
-  conservation, auditor ciphertexts (Baby Jubjub ElGamal gadget), and note
-  encryption to the recipient, without which a transfer cannot be received.
-- Outgoing viewing keys and note encryption to the recipient and the
-  auditor (the key hierarchy above already gives `ivk` for the key
-  agreement).
-- Pool program: `Transfer` once `C_transfer` exists, a real program id,
-  Token-2022 coverage.
-- Client glue: Merkle path tracking from chain state, proving, transaction
-  assembly (Epic 4).
+- Outgoing viewing keys (a sender recovering its own outputs), memo
+  fields, and the fvk registration flow with the custodian.
+- Relayer fees and a public-value field in `C_transfer`, so a relayer can
+  submit on a user's behalf.
+- A client against a real cluster: the indexer over RPC transaction
+  history (or program logs) instead of the instructions in hand, and the
+  prover as a service the wallet calls.
+- Cross-pool transfers (`C_crosspool`, the claim accumulator, the
+  receiving institution's co-signature).
+- Pool program: a real program id, Token-2022 coverage, a Groth16
+  ceremony or the Plonk fallback.

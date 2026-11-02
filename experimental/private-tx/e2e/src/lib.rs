@@ -7,6 +7,10 @@
 //! recomputed here with light-poseidon so every in-circuit hash is checked
 //! against the Poseidon the Solana syscall implements.
 
+pub mod curve;
+pub mod encrypt;
+pub mod indexer;
+
 use {
     ark_bn254::Fr,
     ark_ff::{BigInteger, PrimeField},
@@ -112,11 +116,37 @@ pub struct NoteOpening {
     pub commitment: String,
 }
 
-impl NoteOpening {
+/// `note.json` of the mint fixture: the note, both ciphertexts, the hashes.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MintFixture {
+    pub note: NoteOpening,
+    pub audit_pk_x: String,
+    pub audit_pk_y: String,
+    pub audit_blob: String,
+    pub enc_blob: String,
+    pub audit_hash: String,
+    pub enc_hash: String,
+}
+
+impl MintFixture {
     pub fn load(fixture: &str) -> Self {
         serde_json::from_slice(&read_fixture(fixture, "note.json")).expect("note.json")
     }
 
+    pub fn audit_pk(&self) -> curve::Point {
+        curve::Point {
+            x: fr_from_hex(&self.audit_pk_x),
+            y: fr_from_hex(&self.audit_pk_y),
+        }
+    }
+}
+
+/// Decodes 0x-prefixed hex of any length.
+pub fn hex_bytes(s: &str) -> Vec<u8> {
+    hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("hex")
+}
+
+impl NoteOpening {
     /// `Poseidon(CM, value, g_d.x, g_d.y, pk_d.x, pk_d.y, r)` under the
     /// circom parameters.
     pub fn poseidon_commitment(&self) -> [u8; 32] {
@@ -171,22 +201,36 @@ pub fn burn_sighash(
 /// `Poseidon(NODE, left, right)` nodes, empty leaf 0 and empty subtrees hashed
 /// up from it. Mirrors `circuits/merkle`.
 pub fn merkle_root(leaves: &[Fr], depth: usize) -> [u8; 32] {
-    let mut level: Vec<Fr> = leaves.to_vec();
+    let levels = merkle_levels(leaves, depth);
     let mut empty = Fr::from(0u64);
     for _ in 0..depth {
-        level = level
+        empty = hash2(empty, empty);
+    }
+    fr_to_bytes(&levels[depth].first().copied().unwrap_or(empty))
+}
+
+/// Every level of the occupied part of the tree, leaves first; positions
+/// past a level's length are the empty subtree of that height.
+pub fn merkle_levels(leaves: &[Fr], depth: usize) -> Vec<Vec<Fr>> {
+    let mut levels = vec![leaves.to_vec()];
+    let mut empty = Fr::from(0u64);
+    for _ in 0..depth {
+        let cur = levels.last().unwrap();
+        let next: Vec<Fr> = cur
             .chunks(2)
             .map(|pair| {
                 let right = pair.get(1).copied().unwrap_or(empty);
                 hash2(pair[0], right)
             })
             .collect();
+        levels.push(next);
         empty = hash2(empty, empty);
     }
-    fr_to_bytes(&level.first().copied().unwrap_or(empty))
+    levels
 }
 
-fn hash2(a: Fr, b: Fr) -> Fr {
+/// `Poseidon(NODE, a, b)`, the tree's node hash.
+pub fn hash2(a: Fr, b: Fr) -> Fr {
     let mut hasher = Poseidon::<Fr>::new_circom(3).expect("width 4");
     hasher
         .hash(&[domain_tag("privtx/node"), a, b])
@@ -243,28 +287,99 @@ impl BurnFixture {
     }
 }
 
-/// The pool fixture (`pool.json`), as written by `privtx pool-fixture`: the
-/// notes in leaf order, the root once all are minted, and the burns proved
-/// against that root. Proofs live in `mint/` (one per note, sharing
-/// `mint/vk.bin`) and `burn/` (one per burn, sharing `burn/vk.bin`).
+/// The pool fixture (`pool.json`), as written by `privtx pool-fixture`: a
+/// whole lifecycle. Shields to Alice (`mints`), a transfer paying Bob with
+/// change, then burns against the final tree. Proofs live in `mint/` (one
+/// per shield, sharing `mint/vk.bin`), `transfer/` and `burn/` (one per
+/// burn, sharing `burn/vk.bin`).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PoolFixture {
     pub depth: usize,
     pub pool: String,
-    pub notes: Vec<NoteOpening>,
+    pub destination: String,
+    pub custodian: PoolCustodian,
+    pub wallets: std::collections::BTreeMap<String, PoolKeys>,
+    pub mints: Vec<PoolMint>,
+    pub transfer: PoolTransfer,
+    pub leaves: Vec<String>,
     pub root: String,
     pub burns: Vec<PoolBurn>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoolCustodian {
+    pub audit_sk: String,
+    pub audit_pk_x: String,
+    pub audit_pk_y: String,
+}
+
+impl PoolCustodian {
+    pub fn audit_pk(&self) -> curve::Point {
+        curve::Point {
+            x: fr_from_hex(&self.audit_pk_x),
+            y: fr_from_hex(&self.audit_pk_y),
+        }
+    }
+    pub fn audit_pk_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&bytes_from_hex(&self.audit_pk_x));
+        out[32..].copy_from_slice(&bytes_from_hex(&self.audit_pk_y));
+        out
+    }
+}
+
+/// A wallet's full viewing key and ivk.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoolKeys {
+    pub ak_x: String,
+    pub ak_y: String,
+    pub nk: String,
+    pub ivk: String,
+}
+
+impl PoolKeys {
+    pub fn wallet(&self) -> indexer::Wallet {
+        indexer::Wallet {
+            ivk: fr_from_hex(&self.ivk),
+            nk: fr_from_hex(&self.nk),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoolMint {
+    pub note: NoteOpening,
+    pub audit_blob: String,
+    pub enc_blob: String,
+    pub audit_hash: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoolTransfer {
+    pub root: String,
+    pub inputs: Vec<u64>,
+    pub nullifiers: Vec<String>,
+    pub commitments: Vec<String>,
+    pub outputs: Vec<NoteOpening>,
+    pub recipients: Vec<String>,
+    pub audit_blob: String,
+    pub enc_blobs: Vec<String>,
+    pub audit_hash: String,
+    pub enc_hash: String,
+    pub sighash: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct PoolBurn {
     pub name: String,
+    pub owner: String,
     pub index: u64,
     pub nullifier: String,
     pub forced: bool,
     pub nk: String,
     pub destination: String,
     pub sighash: String,
+    pub siblings: Vec<String>,
 }
 
 impl PoolFixture {
@@ -272,13 +387,23 @@ impl PoolFixture {
         serde_json::from_slice(&read_fixture(fixture, "pool.json")).expect("pool.json")
     }
 
-    /// The `C_mint` proof of note `i`.
+    /// The `C_mint` proof of shield `i`.
     pub fn mint_proof(&self, fixture: &str, i: usize) -> Groth16Fixture {
         load_groth16_files(
             fixture,
             "mint/vk.bin",
             &format!("mint/proof-{i}.bin"),
             &format!("mint/public-{i}.bin"),
+        )
+    }
+
+    /// The `C_transfer` proof.
+    pub fn transfer_proof(&self, fixture: &str) -> Groth16Fixture {
+        load_groth16_files(
+            fixture,
+            "transfer/vk.bin",
+            "transfer/proof.bin",
+            "transfer/public.bin",
         )
     }
 
@@ -292,13 +417,19 @@ impl PoolFixture {
         )
     }
 
-    /// The tree root recomputed from the notes' commitments.
+    /// The final tree root recomputed from the leaves.
     pub fn poseidon_root(&self) -> [u8; 32] {
-        let leaves: Vec<Fr> = self
-            .notes
-            .iter()
-            .map(|n| fr_from_hex(&n.commitment))
-            .collect();
+        let leaves: Vec<Fr> = self.leaves.iter().map(|l| fr_from_hex(l)).collect();
         merkle_root(&leaves, self.depth)
+    }
+
+    /// The note at leaf `index`: a shield's or a transfer output's.
+    pub fn note_at(&self, index: u64) -> &NoteOpening {
+        let i = index as usize;
+        if i < self.mints.len() {
+            &self.mints[i].note
+        } else {
+            &self.transfer.outputs[i - self.mints.len()]
+        }
     }
 }

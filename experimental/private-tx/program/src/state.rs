@@ -9,15 +9,17 @@
 //! [40   ..   72]  issuer           signs mints
 //! [72   ..  104]  mint_key         verifier key account of C_mint
 //! [104  ..  136]  burn_key         verifier key account of C_burn
-//! [136  ..  168]  token_program    SPL Token program the vault lives under
-//! [168  ..  200]  token_mint       the pool's asset
-//! [200  ..  232]  vault            token account holding the backing
-//! [232  ..  240]  supply           u64 LE, minted minus burned
-//! [240  ..  248]  next_index       u64 LE, leaves appended so far
-//! [248  ..  256]  root_pos         u64 LE, next root-history slot
-//! [256  .. 1280]  filled[32]       rightmost filled node per height
-//! [1280 .. 2304]  zeros[32]        empty subtree per height (zeros[0] = 0)
-//! [2304 .. 4352]  roots[64]        ring of recent roots, BE field elements
+//! [136  ..  168]  transfer_key     verifier key account of C_transfer
+//! [168  ..  200]  token_program    SPL Token program the vault lives under
+//! [200  ..  232]  token_mint       the pool's asset
+//! [232  ..  264]  vault            token account holding the backing
+//! [264  ..  328]  audit_pk         custodian's audit key (x ‖ y), outputs are encrypted to it
+//! [328  ..  336]  supply           u64 LE, minted minus burned
+//! [336  ..  344]  next_index       u64 LE, leaves appended so far
+//! [344  ..  352]  root_pos         u64 LE, next root-history slot
+//! [352  .. 1376]  filled[32]       rightmost filled node per height
+//! [1376 .. 2400]  zeros[32]        empty subtree per height (zeros[0] = 0)
+//! [2400 .. 4448]  roots[64]        ring of recent roots, BE field elements
 //! ```
 //!
 //! The vault is an SPL Token account owned by the vault authority PDA
@@ -53,10 +55,12 @@ pub const CUSTODIAN_OFFSET: usize = 8;
 pub const ISSUER_OFFSET: usize = CUSTODIAN_OFFSET + 32;
 pub const MINT_KEY_OFFSET: usize = ISSUER_OFFSET + 32;
 pub const BURN_KEY_OFFSET: usize = MINT_KEY_OFFSET + 32;
-pub const TOKEN_PROGRAM_OFFSET: usize = BURN_KEY_OFFSET + 32;
+pub const TRANSFER_KEY_OFFSET: usize = BURN_KEY_OFFSET + 32;
+pub const TOKEN_PROGRAM_OFFSET: usize = TRANSFER_KEY_OFFSET + 32;
 pub const TOKEN_MINT_OFFSET: usize = TOKEN_PROGRAM_OFFSET + 32;
 pub const VAULT_OFFSET: usize = TOKEN_MINT_OFFSET + 32;
-pub const SUPPLY_OFFSET: usize = VAULT_OFFSET + 32;
+pub const AUDIT_PK_OFFSET: usize = VAULT_OFFSET + 32;
+pub const SUPPLY_OFFSET: usize = AUDIT_PK_OFFSET + 64;
 pub const NEXT_INDEX_OFFSET: usize = SUPPLY_OFFSET + 8;
 pub const ROOT_POS_OFFSET: usize = NEXT_INDEX_OFFSET + 8;
 pub const FILLED_OFFSET: usize = ROOT_POS_OFFSET + 8;
@@ -105,10 +109,12 @@ impl<'a> Pool<'a> {
         issuer: &Address,
         mint_key: &Address,
         burn_key: &Address,
+        transfer_key: &Address,
         token_program: &Address,
         token_mint: &Address,
         vault: &Address,
         vault_bump: u8,
+        audit_pk: &[u8; 64],
     ) -> Result<Self, ProgramError> {
         if data.len() != POOL_ACCOUNT_LEN {
             return Err(PoolError::InvalidPoolAccount.into());
@@ -123,12 +129,14 @@ impl<'a> Pool<'a> {
             (ISSUER_OFFSET, issuer),
             (MINT_KEY_OFFSET, mint_key),
             (BURN_KEY_OFFSET, burn_key),
+            (TRANSFER_KEY_OFFSET, transfer_key),
             (TOKEN_PROGRAM_OFFSET, token_program),
             (TOKEN_MINT_OFFSET, token_mint),
             (VAULT_OFFSET, vault),
         ] {
             data[offset..offset + 32].copy_from_slice(a.as_ref());
         }
+        data[AUDIT_PK_OFFSET..AUDIT_PK_OFFSET + 64].copy_from_slice(audit_pk);
 
         let mut pool = Self { data };
         // zeros[0] is the empty leaf, 0, already there. Each height hashes the
@@ -155,8 +163,17 @@ impl<'a> Pool<'a> {
     pub fn burn_key(&self) -> &[u8; 32] {
         self.addr(BURN_KEY_OFFSET)
     }
+    pub fn transfer_key(&self) -> &[u8; 32] {
+        self.addr(TRANSFER_KEY_OFFSET)
+    }
     pub fn token_program(&self) -> &[u8; 32] {
         self.addr(TOKEN_PROGRAM_OFFSET)
+    }
+    /// The custodian's audit key, `x ‖ y`.
+    pub fn audit_pk(&self) -> &[u8; 64] {
+        self.data[AUDIT_PK_OFFSET..AUDIT_PK_OFFSET + 64]
+            .try_into()
+            .unwrap()
     }
     pub fn token_mint(&self) -> &[u8; 32] {
         self.addr(TOKEN_MINT_OFFSET)
@@ -273,6 +290,12 @@ pub mod domain {
     pub const NODE: [u8; 32] = tag(b"privtx/node");
     /// Burn sighash: `Poseidon(SIGHASH, pool halves, destination halves, nullifier, value)`.
     pub const SIGHASH: [u8; 32] = tag(b"privtx/sighash");
+    /// Transfer sighash: `Poseidon(TSIGHASH, pool halves, nf_0, nf_1, cm_0, cm_1, audit_hash, enc_hash)`.
+    pub const TSIGHASH: [u8; 32] = tag(b"privtx/tsighash");
+    /// Audit statement: `Poseidon(AUDIT, apk, epk, ciphertext elements..., extra...)`.
+    pub const AUDIT: [u8; 32] = tag(b"privtx/audit");
+    /// Recipient ciphertext binding: `Poseidon(ENCH, 31-byte chunks of the blobs)`.
+    pub const ENCH: [u8; 32] = tag(b"privtx/ench");
 
     /// The name right-aligned in 32 bytes: its big-endian integer.
     pub const fn tag<const N: usize>(name: &[u8; N]) -> [u8; 32] {
@@ -335,6 +358,102 @@ pub fn burn_sighash(
         Parameters::Bn254X5,
         Endianness::BigEndian,
         &[&domain::SIGHASH, &p0, &p1, &d0, &d1, nullifier, &v],
+    )
+    .map(|h| h.to_bytes())
+    .map_err(|_| PoolError::PoseidonFailed.into())
+}
+
+/// Sizes of the ciphertexts an instruction carries (`circuits/encrypt`).
+pub mod blob {
+    /// Recipient blob: compressed epk (32) ‖ 51-byte ciphertext.
+    pub const RECIPIENT_LEN: usize = 32 + 8 + 11 + 32;
+    /// Ciphertext field elements per note in the audit blob.
+    pub const AUDIT_ELEMENTS: usize = 3;
+    /// Audit blob for `n` notes: epk (64) ‖ 3·n elements.
+    pub const fn audit_len(notes: usize) -> usize {
+        64 + 32 * AUDIT_ELEMENTS * notes
+    }
+    /// Bytes of recipient blobs per field element of `enc_hash`.
+    pub const CHUNK: usize = 31;
+}
+
+/// `enc_hash` of the recipient blobs: `Poseidon(ENCH, chunks)` where the
+/// concatenated blobs are cut into 31-byte big-endian chunks, zero-padded.
+/// At most 11 chunks (341 bytes), the syscall's width less the tag.
+pub fn enc_hash(blobs: &[u8]) -> Result<[u8; 32], ProgramError> {
+    let n = blobs.len().div_ceil(blob::CHUNK);
+    if n > 11 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut chunks = [[0u8; 32]; 11];
+    for (i, c) in blobs.chunks(blob::CHUNK).enumerate() {
+        chunks[i][1..1 + c.len()].copy_from_slice(c);
+    }
+    let mut inputs: [&[u8]; 12] = [&[]; 12];
+    inputs[0] = &domain::ENCH;
+    for i in 0..n {
+        inputs[1 + i] = &chunks[i];
+    }
+    hashv(Parameters::Bn254X5, Endianness::BigEndian, &inputs[..1 + n])
+        .map(|h| h.to_bytes())
+        .map_err(|_| PoolError::PoseidonFailed.into())
+}
+
+/// `audit_hash`: `Poseidon(AUDIT, apk.x, apk.y, epk.x, epk.y, c..., extra...)`
+/// over an audit blob (`epk ‖ c...`, 32-byte elements) and the pool's audit
+/// key. At most 12 inputs in all.
+pub fn audit_hash(
+    audit_pk: &[u8; 64],
+    audit_blob: &[u8],
+    extra: &[[u8; 32]],
+) -> Result<[u8; 32], ProgramError> {
+    if audit_blob.len() < 64 || !audit_blob.len().is_multiple_of(32) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let elements = audit_blob.len() / 32;
+    let n = 1 + 2 + elements + extra.len();
+    if n > 12 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut inputs: [&[u8]; 12] = [&[]; 12];
+    inputs[0] = &domain::AUDIT;
+    inputs[1] = &audit_pk[..32];
+    inputs[2] = &audit_pk[32..];
+    for i in 0..elements {
+        inputs[3 + i] = &audit_blob[32 * i..32 * (i + 1)];
+    }
+    for (i, e) in extra.iter().enumerate() {
+        inputs[3 + elements + i] = e;
+    }
+    hashv(Parameters::Bn254X5, Endianness::BigEndian, &inputs[..n])
+        .map(|h| h.to_bytes())
+        .map_err(|_| PoolError::PoseidonFailed.into())
+}
+
+/// The transfer sighash both owners signed (`circuits/transfer.SigHash`):
+/// `Poseidon(TSIGHASH, pool halves, nf_0, nf_1, cm_0, cm_1, audit_hash, enc_hash)`.
+pub fn transfer_sighash(
+    pool: &[u8; 32],
+    nullifiers: &[[u8; 32]; 2],
+    commitments: &[[u8; 32]; 2],
+    audit_hash: &[u8; 32],
+    enc_hash: &[u8; 32],
+) -> Result<[u8; 32], ProgramError> {
+    let [p0, p1] = address_halves(pool);
+    hashv(
+        Parameters::Bn254X5,
+        Endianness::BigEndian,
+        &[
+            &domain::TSIGHASH,
+            &p0,
+            &p1,
+            &nullifiers[0],
+            &nullifiers[1],
+            &commitments[0],
+            &commitments[1],
+            audit_hash,
+            enc_hash,
+        ],
     )
     .map(|h| h.to_bytes())
     .map_err(|_| PoolError::PoseidonFailed.into())

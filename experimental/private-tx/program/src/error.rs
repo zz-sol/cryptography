@@ -34,6 +34,8 @@ pub enum PoolError {
     /// The vault is not an initialized token account of the pool's mint
     /// owned by the vault authority.
     InvalidVaultAccount = 13,
+    /// A transfer spends the same note twice.
+    DuplicateNullifier = 14,
 }
 
 impl From<PoolError> for ProgramError {

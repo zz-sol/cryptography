@@ -22,22 +22,18 @@
 
 use {
     super::{
-        expect_owned_by, expect_signer, expect_verifier, expect_writable, take, token_transfer,
-        verify_proof,
+        expect_owned_by, expect_signer, expect_verifier, expect_writable, record_nullifier, take,
+        token_transfer, verify_proof,
     },
     crate::{
         error::PoolError,
-        state::{
-            burn_sighash, u64_to_field, Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR,
-            NULLIFIER_SEED, VAULT_SEED,
-        },
+        state::{burn_sighash, u64_to_field, Pool, VAULT_SEED},
     },
     pinocchio::{
         cpi::{Seed, Signer},
         error::ProgramError,
         AccountView, Address, ProgramResult,
     },
-    pinocchio_system::instructions::CreateAccount,
     solana_groth16_verify::constants::{PROOF_SIZE, SYSTEM_PROGRAM_ID},
 };
 
@@ -96,21 +92,6 @@ pub fn process(
         (*p.token_program(), p.vault_bump())
     };
 
-    // The nullifier account must be the PDA and must not exist yet.
-    let (expected, bump) = Address::find_program_address(
-        &[NULLIFIER_SEED, pool.address().as_ref(), nullifier],
-        program_id,
-    );
-    if nullifier_account.address() != &expected {
-        return Err(PoolError::NullifierAddressMismatch.into());
-    }
-    if nullifier_account.lamports() != 0
-        || nullifier_account.data_len() != 0
-        || !nullifier_account.owned_by(&SYSTEM_PROGRAM_ID)
-    {
-        return Err(PoolError::NullifierAlreadySpent.into());
-    }
-
     let sighash = burn_sighash(
         pool.address().as_array(),
         destination.address().as_array(),
@@ -130,22 +111,7 @@ pub fn process(
     )?;
 
     // Record the spend: creating the PDA is what makes a second burn fail.
-    let bump = [bump];
-    let seeds = [
-        Seed::from(NULLIFIER_SEED),
-        Seed::from(pool.address().as_ref()),
-        Seed::from(nullifier.as_slice()),
-        Seed::from(&bump),
-    ];
-    CreateAccount::with_minimum_balance(
-        payer,
-        nullifier_account,
-        NULLIFIER_ACCOUNT_LEN as u64,
-        program_id,
-        None,
-    )?
-    .invoke_signed(&[Signer::from(&seeds)])?;
-    nullifier_account.try_borrow_mut()?[0] = NULLIFIER_DISCRIMINATOR;
+    record_nullifier(program_id, pool, payer, nullifier_account, nullifier)?;
 
     // Release the backing to the destination the proof was made for.
     let vault_bump = [vault_bump];

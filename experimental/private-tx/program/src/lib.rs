@@ -16,8 +16,10 @@
 //! Instruction data is `tag ‖ payload`; see [`instruction`] (host side) and
 //! [`processor`] for the exact layouts. The pool wraps one SPL Token mint:
 //! `Mint` is a shield (the depositor's tokens move into the pool's vault,
-//! a note is created) and `Burn` an unshield or forfeiture (the vault pays
-//! the destination the proof was made for).
+//! a note is created), `Transfer` moves value between notes inside the
+//! pool, and `Burn` an unshield or forfeiture (the vault pays the
+//! destination the proof was made for). Every output note comes with a
+//! ciphertext for its recipient and one for the custodian's audit key.
 
 pub mod error;
 pub mod processor;

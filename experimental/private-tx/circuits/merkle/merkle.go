@@ -50,6 +50,17 @@ var zeros = func() [Depth + 1]fr.Element {
 // EmptyRoot is the root of a tree with no leaves.
 func EmptyRoot() fr.Element { return zeros[Depth] }
 
+// EmptyPath is the path of leaf 0 in an empty tree: every sibling an empty
+// subtree. It is the witness of a dummy (zero-value) spend, whose root
+// check the transfer circuit skips.
+func EmptyPath() Path {
+	var p Path
+	for h := range p.Siblings {
+		p.Siblings[h] = zeros[h]
+	}
+	return p
+}
+
 // Tree is an in-memory append-only tree.
 type Tree struct {
 	leaves []fr.Element

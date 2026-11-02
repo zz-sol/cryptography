@@ -1,14 +1,20 @@
 //! The pool program end to end, under Mollusk with both SBF artifacts and
-//! the SPL Token program: a pool is created over a token mint with the
-//! fixture's `C_mint` and `C_burn` keys and a vault, every note of the pool
-//! fixture is shielded (tokens into the vault, a verified proof, a leaf),
-//! the on-chain root then equals the fixture's root and a light-poseidon
-//! tree over the same leaves, and the two burns (owner unshield, custodian
-//! forfeiture) pay their destination token account from the vault, with
-//! every misuse rejected: replayed nullifier, unknown root, forfeiture
-//! without the custodian, swapped destination (the mempool replay the
-//! sighash exists for), wrong vault, insufficient deposit, tampered public
-//! inputs.
+//! the SPL Token program, replaying the pool fixture's lifecycle: a pool is
+//! created over a token mint with the fixture's keys, a vault and the
+//! custodian's audit key; five notes are shielded to Alice; Alice pays Bob
+//! with change in one `Transfer`; Alice unshields a note, the custodian
+//! forfeits another, Bob unshields what he received.
+//!
+//! Alongside, the indexer rebuilds the pool's history from the very
+//! instructions submitted, Alice's and Bob's wallets scan it with their
+//! incoming viewing keys and find exactly their notes, the rebuilt Merkle
+//! path of a burned leaf equals the one the prover used, and the custodian
+//! decrypts the transfer's outputs from the audit blob.
+//!
+//! Every misuse is rejected: replayed or duplicate nullifier, unknown
+//! root, forfeiture without the custodian, swapped destination, tampered
+//! ciphertexts, wrong vault or token program, insufficient deposit,
+//! tampered public inputs.
 //!
 //! Skips unless both `solana_groth16_program.so` (`SBF_OUT_DIR`) and
 //! `private_tx_pool.so` (`POOL_SBF_OUT_DIR`, default
@@ -22,13 +28,17 @@ use {
         result::{InstructionResult, ProgramResult},
     },
     mollusk_svm_programs_token::token,
-    private_tx_e2e::{burn_sighash, bytes_from_hex, PoolBurn, PoolFixture},
+    private_tx_e2e::{
+        burn_sighash, bytes_from_hex, encrypt, fr_from_hex, hex_bytes,
+        indexer::{Indexer, Wallet},
+        PoolBurn, PoolFixture,
+    },
     private_tx_pool::{
         error::PoolError,
         instruction::{self as pool_ix, PoolConfig},
         state::{
-            token_account, Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR, POOL_ACCOUNT_LEN,
-            ROOTS_OFFSET,
+            blob, token_account, Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR,
+            POOL_ACCOUNT_LEN, ROOTS_OFFSET,
         },
     },
     solana_account::Account,
@@ -40,10 +50,12 @@ use {
 
 const FIXTURE: &str = "pool";
 
-/// Account state carried from one instruction to the next.
+/// Account state carried from one instruction to the next, and the
+/// indexer watching what goes through.
 struct World {
     h: sbf::Harness,
     accounts: Vec<(Address, Account)>,
+    indexer: Indexer,
 }
 
 impl World {
@@ -57,8 +69,8 @@ impl World {
     }
 
     /// Runs one instruction against the current state and, on success,
-    /// adopts the resulting accounts. Accounts not seen before start empty,
-    /// except the verifier program, which gets an executable program account.
+    /// adopts the resulting accounts and lets the indexer see it. Accounts
+    /// not seen before start empty, except the programs.
     fn run(&mut self, ix: &Instruction) -> InstructionResult {
         for m in &ix.accounts {
             if self.accounts.iter().any(|(k, _)| *k == m.pubkey) {
@@ -76,6 +88,7 @@ impl World {
         let r = self.h.mollusk.process_instruction(ix, &self.accounts);
         if r.program_result.is_ok() {
             self.accounts = r.resulting_accounts.clone();
+            self.indexer.observe(ix);
         }
         r
     }
@@ -125,6 +138,10 @@ fn proof_bytes(p: &[u8]) -> &[u8; PROOF_SIZE] {
     p.try_into().unwrap()
 }
 
+fn arr<const N: usize>(v: &[u8]) -> [u8; N] {
+    v.try_into().expect("length")
+}
+
 fn assert_pool_error(r: &InstructionResult, e: PoolError) {
     sbf::assert_custom_error(r, e as u32);
 }
@@ -153,24 +170,27 @@ struct Setup {
     depositor: Address,
     /// The destination token account the fixture's burns were signed for.
     destination: Address,
+    alice: Wallet,
+    bob: Wallet,
 }
 
 impl Setup {
     fn vault_amount(&self) -> u64 {
         token_amount(self.w.get(&self.config.vault))
     }
-    fn total(&self) -> u64 {
-        self.f.notes.iter().map(|n| n.value).sum()
+    fn shielded(&self) -> u64 {
+        self.f.mints.iter().map(|m| m.note.value).sum()
     }
 }
 
-/// Registers both keys, sets up the token accounts, creates and initializes
-/// a pool.
+/// Registers the three keys, sets up the token accounts, creates and
+/// initializes a pool.
 fn setup() -> Option<Setup> {
     let h = sbf::Harness::with_pool()?;
     let f = PoolFixture::load(FIXTURE);
     let mint_key = h.register(&f.mint_proof(FIXTURE, 0).key);
     let burn_key = h.register(&f.burn_proof(FIXTURE, &f.burns[0]).key);
+    let transfer_key = h.register(&f.transfer_proof(FIXTURE).key);
 
     let payer = Address::new_unique();
     let issuer = Address::new_unique();
@@ -178,20 +198,22 @@ fn setup() -> Option<Setup> {
     // The fixture's burns were signed for this pool address and this
     // destination token account.
     let pool = Address::new_from_array(bytes_from_hex(&f.pool));
-    let destination = Address::new_from_array(bytes_from_hex(&f.burns[0].destination));
+    let destination = Address::new_from_array(bytes_from_hex(&f.destination));
     let token_mint = Address::new_unique();
     let vault = Address::new_unique();
     let depositor = Address::new_unique();
     let recipient = Address::new_unique();
-    let total: u64 = f.notes.iter().map(|n| n.value).sum();
+    let total: u64 = f.mints.iter().map(|m| m.note.value).sum();
     let config = PoolConfig {
         custodian,
         issuer,
         mint_key: mint_key.0,
         burn_key: burn_key.0,
+        transfer_key: transfer_key.0,
         token_program: token::ID,
         token_mint,
         vault,
+        audit_pk: f.custodian.audit_pk_bytes(),
     };
     let vault_authority = pool_ix::find_vault_authority(&pool).0;
     let mut w = World {
@@ -202,6 +224,7 @@ fn setup() -> Option<Setup> {
             (pool, Account::default()),
             mint_key.clone(),
             burn_key.clone(),
+            transfer_key.clone(),
             keyed_account_for_system_program(),
             token::keyed_account(),
             (vault, token_account_of(&token_mint, &vault_authority, 0)),
@@ -209,6 +232,7 @@ fn setup() -> Option<Setup> {
             (destination, token_account_of(&token_mint, &recipient, 0)),
         ],
         h,
+        indexer: Indexer::default(),
     };
 
     let lamports = w.h.rent_exempt(POOL_ACCOUNT_LEN);
@@ -227,6 +251,8 @@ fn setup() -> Option<Setup> {
     // A second initialization of the same account is refused.
     assert_pool_error(&w.run(&init), PoolError::AlreadyInitialized);
 
+    let alice = f.wallets["alice"].wallet();
+    let bob = f.wallets["bob"].wallet();
     Some(Setup {
         w,
         f,
@@ -235,26 +261,32 @@ fn setup() -> Option<Setup> {
         payer,
         depositor,
         destination,
+        alice,
+        bob,
     })
 }
 
 fn mint_ix(s: &Setup, i: usize) -> Instruction {
     let g = s.f.mint_proof(FIXTURE, i);
-    let note = &s.f.notes[i];
-    assert_eq!(g.public_inputs[0], note.commitment_bytes());
+    let m = &s.f.mints[i];
+    assert_eq!(g.public_inputs[0], m.note.commitment_bytes());
+    assert_eq!(g.public_inputs[2], bytes_from_hex(&m.audit_hash));
     pool_ix::mint(
         &s.pool,
         &s.config,
         &s.depositor,
         &s.payer,
         proof_bytes(&g.proof.0),
-        &note.commitment_bytes(),
-        note.value,
+        &m.note.commitment_bytes(),
+        m.note.value,
+        &arr(&hex_bytes(&m.audit_blob)),
+        &arr(&hex_bytes(&m.enc_blob)),
     )
 }
 
-/// Mints every note of the fixture, checking the tree and supply as it goes.
-fn mint_all(s: &mut Setup) {
+/// Shields every note of the fixture, checking the tree, the supply and
+/// the vault as it goes.
+fn shield_all(s: &mut Setup) {
     let empty_root = with_pool(&s.w, &s.pool, |p| *p.current_root());
     assert_eq!(
         empty_root,
@@ -262,35 +294,89 @@ fn mint_all(s: &mut Setup) {
         "empty root on-chain disagrees with light-poseidon"
     );
 
-    let total = s.total();
+    let total = s.shielded();
     let mut expected_supply = 0u64;
-    for i in 0..s.f.notes.len() {
+    for i in 0..s.f.mints.len() {
         let ix = mint_ix(s, i);
         let r = s.w.run(&ix);
         sbf::assert_success(&r);
         println!("Mint #{i}: {} CUs", r.compute_units_consumed);
-        expected_supply += s.f.notes[i].value;
+        expected_supply += s.f.mints[i].note.value;
         with_pool(&s.w, &s.pool, |p| {
             assert_eq!(p.next_index(), i as u64 + 1);
             assert_eq!(p.supply(), expected_supply);
         });
-        // The deposit backs the supply.
         assert_eq!(s.vault_amount(), expected_supply);
         assert_eq!(token_amount(s.w.get(&s.depositor)), total - expected_supply);
     }
     let root = with_pool(&s.w, &s.pool, |p| *p.current_root());
-    assert_eq!(root, bytes_from_hex(&s.f.root), "pool.json root");
     assert_eq!(
         root,
-        s.f.poseidon_root(),
-        "on-chain tree disagrees with a light-poseidon tree over the leaves"
+        bytes_from_hex(&s.f.transfer.root),
+        "root after the shields is the one the transfer was proved against"
     );
-    with_pool(&s.w, &s.pool, |p| assert!(p.knows_root(&root)));
+    assert_eq!(
+        root,
+        s.w.indexer.root(s.f.depth),
+        "the indexer's tree disagrees with the chain"
+    );
+}
+
+fn transfer_ix(s: &Setup) -> Instruction {
+    let g = s.f.transfer_proof(FIXTURE);
+    let t = &s.f.transfer;
+    let nullifiers = [
+        bytes_from_hex(&t.nullifiers[0]),
+        bytes_from_hex(&t.nullifiers[1]),
+    ];
+    let commitments = [
+        bytes_from_hex(&t.commitments[0]),
+        bytes_from_hex(&t.commitments[1]),
+    ];
+    let audit_blob = hex_bytes(&t.audit_blob);
+    let enc_blobs: Vec<u8> = t.enc_blobs.iter().flat_map(|b| hex_bytes(b)).collect();
+    // The fixture's hashes are what the program will recompute.
+    let enc_hash = encrypt::enc_hash(&enc_blobs);
+    assert_eq!(enc_hash, bytes_from_hex(&t.enc_hash));
+    let audit_hash = encrypt::audit_hash(&s.f.custodian.audit_pk(), &audit_blob, &[]);
+    assert_eq!(audit_hash, bytes_from_hex(&t.audit_hash));
+    let sighash = encrypt::transfer_sighash(
+        s.pool.as_array(),
+        &nullifiers,
+        &commitments,
+        &audit_hash,
+        &enc_hash,
+    );
+    assert_eq!(sighash, bytes_from_hex(&t.sighash));
+    assert_eq!(
+        g.public_inputs,
+        vec![
+            bytes_from_hex(&t.root),
+            nullifiers[0],
+            nullifiers[1],
+            commitments[0],
+            commitments[1],
+            audit_hash,
+            sighash
+        ],
+        "transfer public inputs"
+    );
+    pool_ix::transfer(
+        &s.pool,
+        &s.config,
+        &s.payer,
+        proof_bytes(&g.proof.0),
+        &bytes_from_hex(&t.root),
+        &nullifiers,
+        &commitments,
+        &arr(&audit_blob),
+        &arr(&enc_blobs),
+    )
 }
 
 fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
     let g = s.f.burn_proof(FIXTURE, b);
-    let note = &s.f.notes[b.index as usize];
+    let note = s.f.note_at(b.index);
     let nullifier = bytes_from_hex(&b.nullifier);
     let destination = Address::new_from_array(bytes_from_hex(&b.destination));
     assert_eq!(destination, s.destination, "one destination per fixture");
@@ -326,22 +412,154 @@ fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
     ix
 }
 
-fn find_burn(s: &Setup, forced: bool) -> PoolBurn {
+fn find_burn(s: &Setup, name: &str) -> PoolBurn {
     s.f.burns
         .iter()
-        .find(|b| b.forced == forced)
+        .find(|b| b.name == name)
         .expect("burn in fixture")
         .clone()
 }
 
 #[test]
-fn mint_builds_the_fixture_tree() {
+fn lifecycle() {
     let Some(mut s) = setup() else { return };
-    mint_all(&mut s);
+    shield_all(&mut s);
+    let shielded = s.shielded();
+
+    // Alice's wallet scans the indexed history and finds her five notes;
+    // Bob finds nothing yet.
+    let alices = s.alice.scan(&s.w.indexer);
+    assert_eq!(alices.len(), s.f.mints.len());
+    for (i, o) in alices.iter().enumerate() {
+        assert_eq!(o.index, i as u64);
+        assert_eq!(o.note.value, s.f.mints[i].note.value);
+        assert_eq!(o.note.commitment(), s.f.mints[i].note.commitment_bytes());
+    }
+    assert!(s.bob.scan(&s.w.indexer).is_empty());
+
+    // The transfer: Alice spends notes 0 and 1, pays Bob, keeps the change.
+    let ix = transfer_ix(&s);
+    let r = s.w.run(&ix);
+    sbf::assert_success(&r);
+    println!("Transfer: {} CUs", r.compute_units_consumed);
+    with_pool(&s.w, &s.pool, |p| {
+        assert_eq!(p.next_index(), s.f.mints.len() as u64 + 2);
+        assert_eq!(p.supply(), shielded, "a transfer moves no value in or out");
+    });
+    assert_eq!(s.vault_amount(), shielded);
+    let root = with_pool(&s.w, &s.pool, |p| *p.current_root());
+    assert_eq!(root, bytes_from_hex(&s.f.root), "pool.json final root");
+    assert_eq!(root, s.f.poseidon_root());
+    assert_eq!(root, s.w.indexer.root(s.f.depth));
+    for nf in &s.f.transfer.nullifiers {
+        let acc =
+            s.w.get(&pool_ix::find_nullifier_address(&s.pool, &bytes_from_hex(nf)).0);
+        assert_eq!(
+            acc.data,
+            vec![NULLIFIER_DISCRIMINATOR; NULLIFIER_ACCOUNT_LEN]
+        );
+    }
+
+    // Wallets after the transfer: Alice has her three untouched notes and
+    // the change, Bob his payment, and neither sees the other's.
+    let t = &s.f.transfer;
+    let alices = s.alice.scan(&s.w.indexer);
+    let bobs = s.bob.scan(&s.w.indexer);
+    assert_eq!(
+        alices.iter().map(|o| o.index).collect::<Vec<_>>(),
+        vec![2, 3, 4, 6],
+        "alice's unspent notes"
+    );
+    assert_eq!(bobs.len(), 1);
+    assert_eq!(bobs[0].index, 5);
+    assert_eq!(bobs[0].note.value, t.outputs[0].value);
+    assert_eq!(bobs[0].note.commitment(), bytes_from_hex(&t.commitments[0]));
+    assert_eq!(alices[3].note.value, t.outputs[1].value);
+    assert_eq!(
+        t.outputs[0].value + t.outputs[1].value,
+        s.f.mints[0].note.value + s.f.mints[1].note.value,
+        "conservation"
+    );
+
+    // The custodian reads both outputs from the audit blob.
+    let seen = encrypt::audit_decrypt(
+        &fr_from_hex(&s.f.custodian.audit_sk),
+        &hex_bytes(&t.audit_blob),
+    )
+    .expect("audit decrypt");
+    assert_eq!(seen.len(), 2);
+    for (i, n) in seen.iter().enumerate() {
+        assert_eq!(n.value, t.outputs[i].value);
+        assert_eq!(n.commitment(), bytes_from_hex(&t.commitments[i]));
+        assert_eq!(n.d, arr::<11>(&bytes_from_hex(&t.outputs[i].d)[21..]));
+    }
+
+    // The indexer rebuilds the Merkle path the prover used for Alice's
+    // unshield.
+    let unshield = find_burn(&s, "unshield");
+    let path = s.w.indexer.path(s.f.depth, unshield.index);
+    assert_eq!(
+        path,
+        unshield
+            .siblings
+            .iter()
+            .map(|h| bytes_from_hex(h))
+            .collect::<Vec<_>>(),
+        "rebuilt Merkle path"
+    );
+
+    // Alice unshields note 2: the vault pays the destination.
+    let ix = burn_ix(&s, &unshield, false);
+    let r = s.w.run(&ix);
+    sbf::assert_success(&r);
+    println!("Burn (unshield): {} CUs", r.compute_units_consumed);
+    let v2 = s.f.note_at(unshield.index).value;
+    assert_eq!(token_amount(s.w.get(&s.destination)), v2);
+    assert_eq!(s.vault_amount(), shielded - v2);
+    // Replaying it: the nullifier account exists.
+    assert_pool_error(&s.w.run(&ix), PoolError::NullifierAlreadySpent);
+    // And Alice's wallet no longer lists the note.
+    assert_eq!(
+        s.alice
+            .scan(&s.w.indexer)
+            .iter()
+            .map(|o| o.index)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 6]
+    );
+
+    // The custodian forfeits note 4, which it read from the shield's audit
+    // blob, with Alice's registered full viewing key. It needs to sign.
+    let forfeit = find_burn(&s, "forfeit");
+    assert_missing_signature(&s.w.run(&burn_ix(&s, &forfeit, false)));
+    let mut ix = burn_ix(&s, &forfeit, true);
+    ix.accounts[6].pubkey = s.config.issuer;
+    assert_missing_signature(&s.w.run(&ix));
+    let ix = burn_ix(&s, &forfeit, true);
+    let r = s.w.run(&ix);
+    sbf::assert_success(&r);
+    println!("Burn (forfeit): {} CUs", r.compute_units_consumed);
+    let v4 = s.f.note_at(forfeit.index).value;
+    assert_eq!(s.vault_amount(), shielded - v2 - v4);
+
+    // Bob unshields what Alice paid him.
+    let bob_burn = find_burn(&s, "unshield-bob");
+    assert_eq!(bob_burn.index, bobs[0].index);
+    let ix = burn_ix(&s, &bob_burn, false);
+    let r = s.w.run(&ix);
+    sbf::assert_success(&r);
+    println!("Burn (unshield, bob): {} CUs", r.compute_units_consumed);
+    let vb = t.outputs[0].value;
+    assert_eq!(s.vault_amount(), shielded - v2 - v4 - vb);
+    assert_eq!(token_amount(s.w.get(&s.destination)), v2 + v4 + vb);
+    with_pool(&s.w, &s.pool, |p| {
+        assert_eq!(p.supply(), shielded - v2 - v4 - vb)
+    });
+    assert!(s.bob.scan(&s.w.indexer).is_empty());
 }
 
 #[test]
-fn mint_rejects_wrong_issuer_key_and_tampered_inputs() {
+fn mint_rejects_wrong_issuer_key_vault_and_tampered_inputs() {
     let Some(mut s) = setup() else { return };
 
     // Not the issuer.
@@ -378,9 +596,18 @@ fn mint_rejects_wrong_issuer_key_and_tampered_inputs() {
 
     // Another value than the proof opens to: the verifier's rejection
     // propagates through the CPI.
+    let value_off = 1 + PROOF_SIZE + 32;
+    let mut ix = mint_ix(&s, 0);
+    ix.data[value_off] ^= 1;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
+
+    // A tampered audit ciphertext, or recipient blob: the hashes change.
+    let mut ix = mint_ix(&s, 0);
+    ix.data[value_off + 8 + 64 + 5] ^= 1;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
     let mut ix = mint_ix(&s, 0);
     let n = ix.data.len();
-    ix.data[n - 8] ^= 1;
+    ix.data[n - 1] ^= 1;
     sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
 
     // Nothing was appended, nothing deposited.
@@ -389,66 +616,72 @@ fn mint_rejects_wrong_issuer_key_and_tampered_inputs() {
         assert_eq!(p.supply(), 0);
     });
     assert_eq!(s.vault_amount(), 0);
+    assert!(s.w.indexer.leaves.is_empty());
 }
 
 #[test]
-fn burn_unshield_and_forfeit() {
+fn transfer_rejects_tampering_and_double_spends() {
     let Some(mut s) = setup() else { return };
-    mint_all(&mut s);
-    let total: u64 = s.f.notes.iter().map(|n| n.value).sum();
-    let unshield = find_burn(&s, false);
-    let forfeit = find_burn(&s, true);
+    shield_all(&mut s);
+    let root_off = 1 + PROOF_SIZE;
+    let audit_off = root_off + 5 * 32;
+    let enc_off = audit_off + blob::audit_len(2);
 
-    // Owner unshield: anyone may submit it, no custodian signature. The
-    // vault pays the destination.
-    let ix = burn_ix(&s, &unshield, false);
-    let r = s.w.run(&ix);
-    sbf::assert_success(&r);
-    println!("Burn (unshield): {} CUs", r.compute_units_consumed);
-    let unshielded = s.f.notes[unshield.index as usize].value;
-    assert_eq!(token_amount(s.w.get(&s.destination)), unshielded);
-    assert_eq!(s.vault_amount(), total - unshielded);
-    let nf_account =
-        pool_ix::find_nullifier_address(&s.pool, &bytes_from_hex(&unshield.nullifier)).0;
-    let nf = s.w.get(&nf_account);
-    assert_eq!(nf.owner, private_tx_pool::ID);
-    assert_eq!(
-        nf.data,
-        vec![NULLIFIER_DISCRIMINATOR; NULLIFIER_ACCOUNT_LEN]
-    );
-    let after_unshield = total - s.f.notes[unshield.index as usize].value;
-    with_pool(&s.w, &s.pool, |p| assert_eq!(p.supply(), after_unshield));
+    // A root the pool never had.
+    let mut ix = transfer_ix(&s);
+    ix.data[root_off + 31] ^= 1;
+    assert_pool_error(&s.w.run(&ix), PoolError::UnknownRoot);
 
-    // Replaying the same burn: the nullifier account exists.
+    // The same nullifier twice (one note spent as both inputs).
+    let mut ix = transfer_ix(&s);
+    let nf0: Vec<u8> = ix.data[root_off + 32..root_off + 64].to_vec();
+    ix.data[root_off + 64..root_off + 96].copy_from_slice(&nf0);
+    ix.accounts[3].pubkey = ix.accounts[2].pubkey;
+    assert_pool_error(&s.w.run(&ix), PoolError::DuplicateNullifier);
+
+    // A tampered recipient blob: the sighash the owners signed changes.
+    let mut ix = transfer_ix(&s);
+    ix.data[enc_off + 40] ^= 1;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
+
+    // A tampered audit ciphertext.
+    let mut ix = transfer_ix(&s);
+    ix.data[audit_off + 64 + 3] ^= 1;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
+
+    // Another output commitment, or nullifier (with its PDA to match).
+    let mut ix = transfer_ix(&s);
+    ix.data[root_off + 96 + 31] ^= 1;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
+    let mut ix = transfer_ix(&s);
+    ix.data[root_off + 32 + 31] ^= 1;
+    let nf: [u8; 32] = ix.data[root_off + 32..root_off + 64].try_into().unwrap();
+    ix.accounts[2].pubkey = pool_ix::find_nullifier_address(&s.pool, &nf).0;
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
+
+    // The wrong key account.
+    let mut ix = transfer_ix(&s);
+    ix.accounts[6].pubkey = s.config.burn_key;
+    assert_pool_error(&s.w.run(&ix), PoolError::WrongVerifyingKey);
+
+    // The real one goes through once...
+    let ix = transfer_ix(&s);
+    sbf::assert_success(&s.w.run(&ix));
+    // ...and not twice.
     assert_pool_error(&s.w.run(&ix), PoolError::NullifierAlreadySpent);
 
-    // Forfeiture needs the custodian's signature...
-    let ix = burn_ix(&s, &forfeit, false);
-    assert_missing_signature(&s.w.run(&ix));
-    // ...from the custodian, not just anyone.
-    let mut ix = burn_ix(&s, &forfeit, true);
-    ix.accounts[6].pubkey = s.config.issuer;
-    assert_missing_signature(&s.w.run(&ix));
-    // With it, the custodian removes the note without the owner's key.
-    let ix = burn_ix(&s, &forfeit, true);
-    let r = s.w.run(&ix);
-    sbf::assert_success(&r);
-    println!("Burn (forfeit): {} CUs", r.compute_units_consumed);
-    let after_forfeit = after_unshield - s.f.notes[forfeit.index as usize].value;
-    with_pool(&s.w, &s.pool, |p| assert_eq!(p.supply(), after_forfeit));
-    assert_eq!(s.vault_amount(), after_forfeit);
-    assert_eq!(
-        token_amount(s.w.get(&s.destination)),
-        total - after_forfeit,
-        "the destination received both burns"
-    );
+    // After it, a burn of a spent note is refused too: Alice's note 0 was
+    // an input, and its nullifier exists.
+    let spent = s.alice.scan(&s.w.indexer);
+    assert!(spent.iter().all(|o| o.index != 0 && o.index != 1));
 }
 
 #[test]
 fn burn_rejects_unknown_root_and_tampered_inputs() {
     let Some(mut s) = setup() else { return };
-    mint_all(&mut s);
-    let unshield = find_burn(&s, false);
+    shield_all(&mut s);
+    sbf::assert_success(&s.w.run(&transfer_ix(&s)));
+    let unshield = find_burn(&s, "unshield");
     let root_off = 1 + PROOF_SIZE;
 
     // A root the pool never had.
@@ -478,14 +711,10 @@ fn burn_rejects_unknown_root_and_tampered_inputs() {
         let mut ix = burn_ix(&s, &unshield, false);
         ix.data[off] ^= 1;
         if what == "nullifier" {
-            // The PDA in the accounts has to match the data for the program to
-            // get as far as the proof.
             let nf: [u8; 32] = ix.data[root_off + 32..root_off + 64].try_into().unwrap();
             ix.accounts[2].pubkey = pool_ix::find_nullifier_address(&s.pool, &nf).0;
         }
         if what == "forced" {
-            // Flipping the flag makes it a forfeiture, so sign as custodian
-            // to get as far as the proof.
             ix.accounts[6].is_signer = true;
         }
         let r = s.w.run(&ix);
@@ -494,9 +723,6 @@ fn burn_rejects_unknown_root_and_tampered_inputs() {
     }
 
     // The mempool replay: same proof, another destination token account.
-    // The program recomputes the sighash from the new destination and the
-    // proof, made over the owner's signature of the old one, no longer
-    // verifies.
     let mut ix = burn_ix(&s, &unshield, false);
     ix.accounts[8].pubkey = s.depositor;
     sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
@@ -527,7 +753,7 @@ fn burn_rejects_unknown_root_and_tampered_inputs() {
     assert_pool_error(&s.w.run(&ix), PoolError::InvalidForcedFlag);
 
     // Nothing changed.
-    let total = s.total();
+    let total = s.shielded();
     with_pool(&s.w, &s.pool, |p| assert_eq!(p.supply(), total));
     assert_eq!(s.vault_amount(), total);
     assert_eq!(token_amount(s.w.get(&s.destination)), 0);

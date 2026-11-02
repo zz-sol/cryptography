@@ -1,21 +1,24 @@
 //! C_mint end to end: the fixture's commitment is the Solana Poseidon of the
-//! note, the proof verifies through the verifier's host path, and, when the
-//! SBF artifact is available, through the verifier program itself.
+//! note, the audit hash is the Solana Poseidon of the audit ciphertext and
+//! the recipient blob's hash, the proof verifies through the verifier's host
+//! path, and, when the SBF artifact is available, through the verifier
+//! program itself.
 
 mod sbf;
 
 use {
-    private_tx_e2e::{load_groth16, u64_to_bytes, NoteOpening},
+    private_tx_e2e::{bytes_from_hex, encrypt, hex_bytes, load_groth16, u64_to_bytes, MintFixture},
     solana_groth16_verify::{constants::FR_MODULUS, verify, Groth16Error, Proof, VerifyingKey},
 };
 
 const FIXTURE: &str = "mint";
 
 #[test]
-fn public_inputs_are_the_commitment_and_the_value() {
+fn public_inputs_are_commitment_value_and_audit_hash() {
     let g = load_groth16(FIXTURE);
-    let note = NoteOpening::load(FIXTURE);
-    assert_eq!(g.public_inputs.len(), 2, "C_mint has two public inputs");
+    let f = MintFixture::load(FIXTURE);
+    let note = &f.note;
+    assert_eq!(g.public_inputs.len(), 3, "C_mint has three public inputs");
     assert_eq!(
         g.public_inputs[0],
         note.commitment_bytes(),
@@ -27,12 +30,29 @@ fn public_inputs_are_the_commitment_and_the_value() {
         "gnark Poseidon gadget disagrees with light-poseidon (Solana sol_poseidon parameters)"
     );
     assert_eq!(g.public_inputs[1], u64_to_bytes(note.value), "public value");
+
+    let enc_blob = hex_bytes(&f.enc_blob);
+    let audit_blob = hex_bytes(&f.audit_blob);
+    assert_eq!(enc_blob.len(), encrypt::RECIPIENT_BLOB_LEN);
+    assert_eq!(audit_blob.len(), 64 + 32 * encrypt::AUDIT_ELEMENTS);
+    let enc_hash = encrypt::enc_hash(&enc_blob);
+    assert_eq!(enc_hash, bytes_from_hex(&f.enc_hash), "note.json enc_hash");
+    let audit_hash = encrypt::audit_hash(&f.audit_pk(), &audit_blob, &[enc_hash]);
+    assert_eq!(
+        audit_hash,
+        bytes_from_hex(&f.audit_hash),
+        "note.json audit_hash"
+    );
+    assert_eq!(
+        g.public_inputs[2], audit_hash,
+        "gnark audit gadget disagrees with light-poseidon over the audit blob"
+    );
 }
 
 #[test]
-fn key_is_plain_groth16_with_two_public_inputs() {
+fn key_is_plain_groth16_with_three_public_inputs() {
     let g = load_groth16(FIXTURE);
-    assert_eq!(g.key.num_public_inputs(), 2);
+    assert_eq!(g.key.num_public_inputs(), 3);
     g.key.validate_for_publish().unwrap();
 }
 
@@ -52,9 +72,13 @@ fn proof_verifies_on_host_path() {
     let mut wrong = flat.clone();
     wrong[63] ^= 1;
     assert_eq!(verify(&vk, &proof, &wrong), Err(Groth16Error::ProofInvalid));
+    // And any other audit hash: the ciphertexts are what the proof says.
+    let mut wrong = flat.clone();
+    wrong[95] ^= 1;
+    assert_eq!(verify(&vk, &proof, &wrong), Err(Groth16Error::ProofInvalid));
     // A non-canonical scalar is rejected before the pairing.
     let mut non_canonical = flat.clone();
-    non_canonical[32..].copy_from_slice(&FR_MODULUS);
+    non_canonical[32..64].copy_from_slice(&FR_MODULUS);
     assert_eq!(
         verify(&vk, &proof, &non_canonical),
         Err(Groth16Error::NonCanonicalScalar)

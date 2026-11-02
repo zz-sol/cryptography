@@ -7,7 +7,7 @@ import (
 )
 
 func TestTagsAreDistinctAndSmall(t *testing.T) {
-	names := []string{CM, NF, NK, ASK, IVK, GD, NODE, SIGHASH}
+	names := []string{CM, NF, NK, ASK, IVK, GD, NODE, SIGHASH, TSIGHASH, KDF, ENC, AUDIT, ENCH}
 	seen := map[fr.Element]string{}
 	for _, n := range names {
 		tag := Tag(n)

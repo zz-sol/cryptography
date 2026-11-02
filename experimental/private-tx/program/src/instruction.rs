@@ -6,7 +6,7 @@ extern crate alloc;
 use {
     crate::{
         processor::PoolTag,
-        state::{NULLIFIER_SEED, POOL_ACCOUNT_LEN, VAULT_SEED},
+        state::{blob, NULLIFIER_SEED, POOL_ACCOUNT_LEN, VAULT_SEED},
         ID, VERIFIER_ID,
     },
     alloc::{vec, vec::Vec},
@@ -31,9 +31,12 @@ pub struct PoolConfig {
     pub issuer: Address,
     pub mint_key: Address,
     pub burn_key: Address,
+    pub transfer_key: Address,
     pub token_program: Address,
     pub token_mint: Address,
     pub vault: Address,
+    /// The custodian's audit key, `x ‖ y`.
+    pub audit_pk: [u8; 64],
 }
 
 /// System-program `CreateAccount` for a pool account, followed by
@@ -62,20 +65,22 @@ pub fn create_pool(
     [create, initialize_pool(pool, config)]
 }
 
-/// Data `[0, custodian, issuer, mint_key, burn_key, token_mint]`. Accounts:
-/// pool (s, w), vault, token program.
+/// Data `[0, custodian, issuer, mint_key, burn_key, transfer_key, token_mint,
+/// audit_pk]`. Accounts: pool (s, w), vault, token program.
 pub fn initialize_pool(pool: &Address, config: &PoolConfig) -> Instruction {
-    let mut data = Vec::with_capacity(1 + 5 * 32);
+    let mut data = Vec::with_capacity(1 + 6 * 32 + 64);
     data.push(PoolTag::InitializePool as u8);
     for a in [
         &config.custodian,
         &config.issuer,
         &config.mint_key,
         &config.burn_key,
+        &config.transfer_key,
         &config.token_mint,
     ] {
         data.extend_from_slice(a.as_ref());
     }
+    data.extend_from_slice(&config.audit_pk);
     Instruction {
         program_id: ID,
         accounts: vec![
@@ -87,9 +92,9 @@ pub fn initialize_pool(pool: &Address, config: &PoolConfig) -> Instruction {
     }
 }
 
-/// Data `[1, proof, commitment, value LE]`. Accounts: pool (w), issuer (s),
-/// verifier program, mint key, source token account (w), source owner (s),
-/// vault (w), token program.
+/// Data `[1, proof, commitment, value LE, audit blob, recipient blob]`.
+/// Accounts: pool (w), issuer (s), verifier program, mint key, source token
+/// account (w), source owner (s), vault (w), token program.
 #[allow(clippy::too_many_arguments)]
 pub fn mint(
     pool: &Address,
@@ -99,12 +104,17 @@ pub fn mint(
     proof: &[u8; PROOF_SIZE],
     commitment: &[u8; 32],
     value: u64,
+    audit_blob: &[u8; blob::audit_len(1)],
+    enc_blob: &[u8; blob::RECIPIENT_LEN],
 ) -> Instruction {
-    let mut data = Vec::with_capacity(1 + PROOF_SIZE + 32 + 8);
+    let mut data =
+        Vec::with_capacity(1 + PROOF_SIZE + 32 + 8 + blob::audit_len(1) + blob::RECIPIENT_LEN);
     data.push(PoolTag::Mint as u8);
     data.extend_from_slice(proof);
     data.extend_from_slice(commitment);
     data.extend_from_slice(&value.to_le_bytes());
+    data.extend_from_slice(audit_blob);
+    data.extend_from_slice(enc_blob);
     Instruction {
         program_id: ID,
         accounts: vec![
@@ -158,6 +168,47 @@ pub fn burn(
             AccountMeta::new(*destination, false),
             AccountMeta::new_readonly(find_vault_authority(pool).0, false),
             AccountMeta::new_readonly(config.token_program, false),
+        ],
+        data,
+    }
+}
+
+/// Data `[3, proof, root, nf_0, nf_1, cm_0, cm_1, audit blob, recipient
+/// blobs]`. Accounts: pool (w), payer (s, w), nullifier PDA 0 (w),
+/// nullifier PDA 1 (w), system program, verifier program, transfer key.
+#[allow(clippy::too_many_arguments)]
+pub fn transfer(
+    pool: &Address,
+    config: &PoolConfig,
+    payer: &Address,
+    proof: &[u8; PROOF_SIZE],
+    root: &[u8; 32],
+    nullifiers: &[[u8; 32]; 2],
+    commitments: &[[u8; 32]; 2],
+    audit_blob: &[u8; blob::audit_len(2)],
+    enc_blobs: &[u8; 2 * blob::RECIPIENT_LEN],
+) -> Instruction {
+    let mut data =
+        Vec::with_capacity(1 + PROOF_SIZE + 5 * 32 + blob::audit_len(2) + 2 * blob::RECIPIENT_LEN);
+    data.push(PoolTag::Transfer as u8);
+    data.extend_from_slice(proof);
+    data.extend_from_slice(root);
+    data.extend_from_slice(&nullifiers[0]);
+    data.extend_from_slice(&nullifiers[1]);
+    data.extend_from_slice(&commitments[0]);
+    data.extend_from_slice(&commitments[1]);
+    data.extend_from_slice(audit_blob);
+    data.extend_from_slice(enc_blobs);
+    Instruction {
+        program_id: ID,
+        accounts: vec![
+            AccountMeta::new(*pool, false),
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(find_nullifier_address(pool, &nullifiers[0]).0, false),
+            AccountMeta::new(find_nullifier_address(pool, &nullifiers[1]).0, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(VERIFIER_ID, false),
+            AccountMeta::new_readonly(config.transfer_key, false),
         ],
         data,
     }

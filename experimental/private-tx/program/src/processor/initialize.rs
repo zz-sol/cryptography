@@ -1,7 +1,7 @@
 //! `InitializePool`.
 //!
 //! Accounts: `[pool (s, w), vault, token program]`. Data:
-//! `custodian (32) ‖ issuer (32) ‖ mint_key (32) ‖ burn_key (32) ‖ token_mint (32)`.
+//! `custodian (32) ‖ issuer (32) ‖ mint_key (32) ‖ burn_key (32) ‖ transfer_key (32) ‖ token_mint (32) ‖ audit_pk (64)`.
 //!
 //! The pool account is created by the client (system `CreateAccount` with
 //! this program as owner and [`POOL_ACCOUNT_LEN`] bytes) and must sign here,
@@ -42,7 +42,9 @@ pub fn process(
     let (issuer, rest) = take::<32>(rest)?;
     let (mint_key, rest) = take::<32>(rest)?;
     let (burn_key, rest) = take::<32>(rest)?;
+    let (transfer_key, rest) = take::<32>(rest)?;
     let (token_mint, rest) = take::<32>(rest)?;
+    let (audit_pk, rest) = take::<64>(rest)?;
     if !rest.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -74,10 +76,12 @@ pub fn process(
         &Address::new_from_array(*issuer),
         &Address::new_from_array(*mint_key),
         &Address::new_from_array(*burn_key),
+        &Address::new_from_array(*transfer_key),
         token_program.address(),
         &Address::new_from_array(*token_mint),
         vault.address(),
         bump,
+        audit_pk,
     )?;
     Ok(())
 }

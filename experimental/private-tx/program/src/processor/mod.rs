@@ -8,6 +8,7 @@
 //! | 0   | [`initialize::process`] `InitializePool` |
 //! | 1   | [`mint::process`] `Mint`               |
 //! | 2   | [`burn::process`] `Burn`               |
+//! | 3   | [`transfer::process`] `Transfer`       |
 
 use {
     crate::{error::PoolError, VERIFIER_ID},
@@ -26,6 +27,7 @@ use {
 pub mod burn;
 pub mod initialize;
 pub mod mint;
+pub mod transfer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -33,6 +35,7 @@ pub enum PoolTag {
     InitializePool = 0,
     Mint = 1,
     Burn = 2,
+    Transfer = 3,
 }
 
 impl PoolTag {
@@ -41,6 +44,7 @@ impl PoolTag {
             0 => Some(Self::InitializePool),
             1 => Some(Self::Mint),
             2 => Some(Self::Burn),
+            3 => Some(Self::Transfer),
             _ => None,
         }
     }
@@ -60,6 +64,7 @@ pub fn process_instruction(
         PoolTag::InitializePool => initialize::process(program_id, accounts, payload),
         PoolTag::Mint => mint::process(program_id, accounts, payload),
         PoolTag::Burn => burn::process(program_id, accounts, payload),
+        PoolTag::Transfer => transfer::process(program_id, accounts, payload),
     }
 }
 
@@ -104,8 +109,8 @@ pub(crate) fn expect_verifier(
     Ok(())
 }
 
-/// Most public inputs any instruction here verifies (`C_burn`: five).
-pub const MAX_PUBLIC_INPUTS: usize = 5;
+/// Most public inputs any instruction here verifies (`C_transfer`: seven).
+pub const MAX_PUBLIC_INPUTS: usize = 7;
 
 /// CPIs `Verify` on the Groth16 verifier: `[3, proof, inputs…]` with the
 /// key account as the only account. The verifier rejects a wrong count of
@@ -166,6 +171,54 @@ pub(crate) fn token_transfer(
         data: &data,
     };
     invoke_signed::<3, _>(&instruction, &[source, destination, authority], signers)
+}
+
+/// Records a spend: the nullifier account must be the PDA
+/// `["nullifier", pool, nullifier]` and must not exist yet; it is created
+/// here (rent from `payer`), which is what makes a second spend fail.
+pub(crate) fn record_nullifier(
+    program_id: &Address,
+    pool: &AccountView,
+    payer: &AccountView,
+    nullifier_account: &mut AccountView,
+    nullifier: &[u8; 32],
+) -> ProgramResult {
+    use {
+        crate::state::{NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR, NULLIFIER_SEED},
+        pinocchio::cpi::Seed,
+        pinocchio_system::instructions::CreateAccount,
+        solana_groth16_verify::constants::SYSTEM_PROGRAM_ID,
+    };
+    let (expected, bump) = Address::find_program_address(
+        &[NULLIFIER_SEED, pool.address().as_ref(), nullifier],
+        program_id,
+    );
+    if nullifier_account.address() != &expected {
+        return Err(PoolError::NullifierAddressMismatch.into());
+    }
+    if nullifier_account.lamports() != 0
+        || nullifier_account.data_len() != 0
+        || !nullifier_account.owned_by(&SYSTEM_PROGRAM_ID)
+    {
+        return Err(PoolError::NullifierAlreadySpent.into());
+    }
+    let bump = [bump];
+    let seeds = [
+        Seed::from(NULLIFIER_SEED),
+        Seed::from(pool.address().as_ref()),
+        Seed::from(nullifier.as_slice()),
+        Seed::from(&bump),
+    ];
+    CreateAccount::with_minimum_balance(
+        payer,
+        nullifier_account,
+        NULLIFIER_ACCOUNT_LEN as u64,
+        program_id,
+        None,
+    )?
+    .invoke_signed(&[Signer::from(&seeds)])?;
+    nullifier_account.try_borrow_mut()?[0] = NULLIFIER_DISCRIMINATOR;
+    Ok(())
 }
 
 /// Splits a fixed-size prefix off `payload`.

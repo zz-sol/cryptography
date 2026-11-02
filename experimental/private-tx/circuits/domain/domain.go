@@ -27,6 +27,16 @@ const (
 	NODE = "privtx/node"
 	// Burn sighash: Poseidon(SIGHASH, pool halves, destination halves, nullifier, value).
 	SIGHASH = "privtx/sighash"
+	// Transfer sighash: Poseidon(TSIGHASH, pool halves, nf_1, nf_2, cm_1, cm_2, audit_hash, enc_hash).
+	TSIGHASH = "privtx/tsighash"
+	// Note encryption key: Poseidon(KDF, ss.x, ss.y, epk.x, epk.y).
+	KDF = "privtx/kdf"
+	// Note encryption keystream: Poseidon(ENC, key, counter).
+	ENC = "privtx/enc"
+	// Audit statement: Poseidon(AUDIT, apk, epk, ciphertext elements..., extra...).
+	AUDIT = "privtx/audit"
+	// Recipient ciphertext binding: Poseidon(ENCH, 31-byte chunks of the blobs).
+	ENCH = "privtx/ench"
 )
 
 // Tag is the field element of a domain name: its ASCII bytes as a big-endian
