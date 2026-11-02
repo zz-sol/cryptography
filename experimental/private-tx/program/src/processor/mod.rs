@@ -12,7 +12,7 @@
 use {
     crate::{error::PoolError, VERIFIER_ID},
     pinocchio::{
-        cpi::invoke,
+        cpi::{invoke, invoke_signed, Signer},
         error::ProgramError,
         instruction::{InstructionAccount, InstructionView},
         AccountView, Address, ProgramResult,
@@ -134,6 +134,38 @@ pub(crate) fn verify_proof(
         data: &data[..end],
     };
     invoke::<1, _>(&instruction, &[key])
+}
+
+/// SPL Token `Transfer` (instruction 3) of `amount` from `source` to
+/// `destination`, authorized by `authority`, through `token_program`, which
+/// must be the one the pool pinned. `signers` carries the vault authority's
+/// seeds when the pool itself is the authority.
+pub(crate) fn token_transfer(
+    token_program: &AccountView,
+    pinned_token_program: &[u8; 32],
+    source: &AccountView,
+    destination: &AccountView,
+    authority: &AccountView,
+    amount: u64,
+    signers: &[Signer],
+) -> ProgramResult {
+    if token_program.address().as_ref() != pinned_token_program {
+        return Err(PoolError::WrongTokenProgram.into());
+    }
+    let mut data = [0u8; 9];
+    data[0] = 3;
+    data[1..].copy_from_slice(&amount.to_le_bytes());
+    let accounts = [
+        InstructionAccount::writable(source.address()),
+        InstructionAccount::writable(destination.address()),
+        InstructionAccount::readonly_signer(authority.address()),
+    ];
+    let instruction = InstructionView {
+        program_id: token_program.address(),
+        accounts: &accounts,
+        data: &data,
+    };
+    invoke_signed::<3, _>(&instruction, &[source, destination, authority], signers)
 }
 
 /// Splits a fixed-size prefix off `payload`.

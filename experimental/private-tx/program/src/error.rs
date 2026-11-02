@@ -27,6 +27,13 @@ pub enum PoolError {
     TreeFull = 9,
     /// The Poseidon syscall failed (bad input length or non-canonical input).
     PoseidonFailed = 10,
+    /// The vault account is not the pool's vault.
+    WrongVault = 11,
+    /// The token program account is not the one the pool was created with.
+    WrongTokenProgram = 12,
+    /// The vault is not an initialized token account of the pool's mint
+    /// owned by the vault authority.
+    InvalidVaultAccount = 13,
 }
 
 impl From<PoolError> for ProgramError {

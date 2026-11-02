@@ -95,6 +95,8 @@ impl Harness {
             &mollusk_svm::program::loader_keys::LOADER_V3,
             &elf,
         );
+        // The pool's vault is an SPL Token account.
+        mollusk_svm_programs_token::token::add_program(&mut h.mollusk);
         Some(h)
     }
 

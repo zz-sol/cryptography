@@ -3,18 +3,26 @@
 //!
 //! ```text
 //! [0    ..    1]  discriminator (1 = pool)
-//! [1    ..    8]  reserved
+//! [1    ..    2]  vault_bump       bump of the vault authority PDA
+//! [2    ..    8]  reserved
 //! [8    ..   40]  custodian        signs forced burns (forfeiture)
 //! [40   ..   72]  issuer           signs mints
 //! [72   ..  104]  mint_key         verifier key account of C_mint
 //! [104  ..  136]  burn_key         verifier key account of C_burn
-//! [136  ..  144]  supply           u64 LE, minted minus burned
-//! [144  ..  152]  next_index       u64 LE, leaves appended so far
-//! [152  ..  160]  root_pos         u64 LE, next root-history slot
-//! [160  .. 1184]  filled[32]       rightmost filled node per height
-//! [1184 .. 2208]  zeros[32]        empty subtree per height (zeros[0] = 0)
-//! [2208 .. 4256]  roots[64]        ring of recent roots, BE field elements
+//! [136  ..  168]  token_program    SPL Token program the vault lives under
+//! [168  ..  200]  token_mint       the pool's asset
+//! [200  ..  232]  vault            token account holding the backing
+//! [232  ..  240]  supply           u64 LE, minted minus burned
+//! [240  ..  248]  next_index       u64 LE, leaves appended so far
+//! [248  ..  256]  root_pos         u64 LE, next root-history slot
+//! [256  .. 1280]  filled[32]       rightmost filled node per height
+//! [1280 .. 2304]  zeros[32]        empty subtree per height (zeros[0] = 0)
+//! [2304 .. 4352]  roots[64]        ring of recent roots, BE field elements
 //! ```
+//!
+//! The vault is an SPL Token account owned by the vault authority PDA
+//! `["vault", pool]`, so only this program can move its balance. `supply`
+//! equals the vault balance as long as nothing else deposits into it.
 //!
 //! Field elements are 32-byte big-endian, as the verifier takes public inputs
 //! and the Poseidon syscall takes inputs with `Endianness::BigEndian`. Every
@@ -40,11 +48,15 @@ pub const POOL_DISCRIMINATOR: u8 = 1;
 pub const NULLIFIER_DISCRIMINATOR: u8 = 2;
 
 pub const DISCRIMINATOR_OFFSET: usize = 0;
+pub const VAULT_BUMP_OFFSET: usize = 1;
 pub const CUSTODIAN_OFFSET: usize = 8;
 pub const ISSUER_OFFSET: usize = CUSTODIAN_OFFSET + 32;
 pub const MINT_KEY_OFFSET: usize = ISSUER_OFFSET + 32;
 pub const BURN_KEY_OFFSET: usize = MINT_KEY_OFFSET + 32;
-pub const SUPPLY_OFFSET: usize = BURN_KEY_OFFSET + 32;
+pub const TOKEN_PROGRAM_OFFSET: usize = BURN_KEY_OFFSET + 32;
+pub const TOKEN_MINT_OFFSET: usize = TOKEN_PROGRAM_OFFSET + 32;
+pub const VAULT_OFFSET: usize = TOKEN_MINT_OFFSET + 32;
+pub const SUPPLY_OFFSET: usize = VAULT_OFFSET + 32;
 pub const NEXT_INDEX_OFFSET: usize = SUPPLY_OFFSET + 8;
 pub const ROOT_POS_OFFSET: usize = NEXT_INDEX_OFFSET + 8;
 pub const FILLED_OFFSET: usize = ROOT_POS_OFFSET + 8;
@@ -56,6 +68,19 @@ pub const POOL_ACCOUNT_LEN: usize = ROOTS_OFFSET + ROOT_HISTORY * FIELD_SIZE;
 pub const NULLIFIER_ACCOUNT_LEN: usize = 1;
 /// PDA seeds: `[NULLIFIER_SEED, pool address, nullifier]`.
 pub const NULLIFIER_SEED: &[u8] = b"nullifier";
+/// Vault authority PDA seeds: `[VAULT_SEED, pool address]`.
+pub const VAULT_SEED: &[u8] = b"vault";
+
+/// SPL Token account layout, the parts read here.
+pub mod token_account {
+    pub const MINT_OFFSET: usize = 0;
+    pub const OWNER_OFFSET: usize = 32;
+    pub const AMOUNT_OFFSET: usize = 64;
+    pub const STATE_OFFSET: usize = 108;
+    pub const STATE_INITIALIZED: u8 = 1;
+    /// The classic layout; Token-2022 accounts are at least this long.
+    pub const LEN: usize = 165;
+}
 
 /// Mutable view over a pool account's data.
 pub struct Pool<'a> {
@@ -73,12 +98,17 @@ impl<'a> Pool<'a> {
 
     /// Initializes zeroed pool data: authorities, keys, the empty tree and
     /// its root as the first history entry. Costs `DEPTH` Poseidon calls.
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         data: &'a mut [u8],
         custodian: &Address,
         issuer: &Address,
         mint_key: &Address,
         burn_key: &Address,
+        token_program: &Address,
+        token_mint: &Address,
+        vault: &Address,
+        vault_bump: u8,
     ) -> Result<Self, ProgramError> {
         if data.len() != POOL_ACCOUNT_LEN {
             return Err(PoolError::InvalidPoolAccount.into());
@@ -87,10 +117,18 @@ impl<'a> Pool<'a> {
             return Err(PoolError::AlreadyInitialized.into());
         }
         data[DISCRIMINATOR_OFFSET] = POOL_DISCRIMINATOR;
-        data[CUSTODIAN_OFFSET..CUSTODIAN_OFFSET + 32].copy_from_slice(custodian.as_ref());
-        data[ISSUER_OFFSET..ISSUER_OFFSET + 32].copy_from_slice(issuer.as_ref());
-        data[MINT_KEY_OFFSET..MINT_KEY_OFFSET + 32].copy_from_slice(mint_key.as_ref());
-        data[BURN_KEY_OFFSET..BURN_KEY_OFFSET + 32].copy_from_slice(burn_key.as_ref());
+        data[VAULT_BUMP_OFFSET] = vault_bump;
+        for (offset, a) in [
+            (CUSTODIAN_OFFSET, custodian),
+            (ISSUER_OFFSET, issuer),
+            (MINT_KEY_OFFSET, mint_key),
+            (BURN_KEY_OFFSET, burn_key),
+            (TOKEN_PROGRAM_OFFSET, token_program),
+            (TOKEN_MINT_OFFSET, token_mint),
+            (VAULT_OFFSET, vault),
+        ] {
+            data[offset..offset + 32].copy_from_slice(a.as_ref());
+        }
 
         let mut pool = Self { data };
         // zeros[0] is the empty leaf, 0, already there. Each height hashes the
@@ -116,6 +154,18 @@ impl<'a> Pool<'a> {
     }
     pub fn burn_key(&self) -> &[u8; 32] {
         self.addr(BURN_KEY_OFFSET)
+    }
+    pub fn token_program(&self) -> &[u8; 32] {
+        self.addr(TOKEN_PROGRAM_OFFSET)
+    }
+    pub fn token_mint(&self) -> &[u8; 32] {
+        self.addr(TOKEN_MINT_OFFSET)
+    }
+    pub fn vault(&self) -> &[u8; 32] {
+        self.addr(VAULT_OFFSET)
+    }
+    pub fn vault_bump(&self) -> u8 {
+        self.data[VAULT_BUMP_OFFSET]
     }
     pub fn supply(&self) -> u64 {
         self.u64_at(SUPPLY_OFFSET)

@@ -1,11 +1,14 @@
-//! The pool program end to end, under Mollusk with both SBF artifacts: a
-//! pool is created with the fixture's `C_mint` and `C_burn` keys, every note
-//! of the pool fixture is minted through a verified proof, the on-chain root
-//! then equals the fixture's root and a light-poseidon tree over the same
-//! leaves, and the two burns (owner unshield, custodian forfeiture) go
-//! through with every misuse rejected: replayed nullifier, unknown root,
-//! forfeiture without the custodian, swapped destination (the mempool
-//! replay the sighash exists for), tampered public inputs.
+//! The pool program end to end, under Mollusk with both SBF artifacts and
+//! the SPL Token program: a pool is created over a token mint with the
+//! fixture's `C_mint` and `C_burn` keys and a vault, every note of the pool
+//! fixture is shielded (tokens into the vault, a verified proof, a leaf),
+//! the on-chain root then equals the fixture's root and a light-poseidon
+//! tree over the same leaves, and the two burns (owner unshield, custodian
+//! forfeiture) pay their destination token account from the vault, with
+//! every misuse rejected: replayed nullifier, unknown root, forfeiture
+//! without the custodian, swapped destination (the mempool replay the
+//! sighash exists for), wrong vault, insufficient deposit, tampered public
+//! inputs.
 //!
 //! Skips unless both `solana_groth16_program.so` (`SBF_OUT_DIR`) and
 //! `private_tx_pool.so` (`POOL_SBF_OUT_DIR`, default
@@ -18,12 +21,14 @@ use {
         program::{create_program_account_loader_v3, keyed_account_for_system_program},
         result::{InstructionResult, ProgramResult},
     },
+    mollusk_svm_programs_token::token,
     private_tx_e2e::{burn_sighash, bytes_from_hex, PoolBurn, PoolFixture},
     private_tx_pool::{
         error::PoolError,
-        instruction as pool_ix,
+        instruction::{self as pool_ix, PoolConfig},
         state::{
-            Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR, POOL_ACCOUNT_LEN, ROOTS_OFFSET,
+            token_account, Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR, POOL_ACCOUNT_LEN,
+            ROOTS_OFFSET,
         },
     },
     solana_account::Account,
@@ -61,6 +66,8 @@ impl World {
             }
             let account = if m.pubkey == private_tx_pool::VERIFIER_ID {
                 create_program_account_loader_v3(&m.pubkey)
+            } else if m.pubkey == token::ID {
+                token::account()
             } else {
                 Account::default()
             };
@@ -83,6 +90,36 @@ fn funded() -> Account {
         rent_epoch: 0,
     }
 }
+
+/// An initialized SPL Token account (classic 165-byte layout).
+fn token_account_of(mint: &Address, owner: &Address, amount: u64) -> Account {
+    let mut data = vec![0u8; token_account::LEN];
+    data[token_account::MINT_OFFSET..token_account::MINT_OFFSET + 32]
+        .copy_from_slice(mint.as_array());
+    data[token_account::OWNER_OFFSET..token_account::OWNER_OFFSET + 32]
+        .copy_from_slice(owner.as_array());
+    data[token_account::AMOUNT_OFFSET..token_account::AMOUNT_OFFSET + 8]
+        .copy_from_slice(&amount.to_le_bytes());
+    data[token_account::STATE_OFFSET] = token_account::STATE_INITIALIZED;
+    Account {
+        lamports: 10_000_000,
+        data,
+        owner: token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+fn token_amount(a: &Account) -> u64 {
+    u64::from_le_bytes(
+        a.data[token_account::AMOUNT_OFFSET..token_account::AMOUNT_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+/// SPL Token's `InsufficientFunds`.
+const TOKEN_INSUFFICIENT_FUNDS: u32 = 1;
 
 fn proof_bytes(p: &[u8]) -> &[u8; PROOF_SIZE] {
     p.try_into().unwrap()
@@ -109,14 +146,26 @@ struct Setup {
     w: World,
     f: PoolFixture,
     pool: Address,
+    config: PoolConfig,
     payer: Address,
-    issuer: Address,
-    custodian: Address,
-    mint_key: Address,
-    burn_key: Address,
+    /// The depositor's token account, owned by `payer`, funded with the
+    /// fixture's total.
+    depositor: Address,
+    /// The destination token account the fixture's burns were signed for.
+    destination: Address,
 }
 
-/// Registers both keys, creates and initializes a pool.
+impl Setup {
+    fn vault_amount(&self) -> u64 {
+        token_amount(self.w.get(&self.config.vault))
+    }
+    fn total(&self) -> u64 {
+        self.f.notes.iter().map(|n| n.value).sum()
+    }
+}
+
+/// Registers both keys, sets up the token accounts, creates and initializes
+/// a pool.
 fn setup() -> Option<Setup> {
     let h = sbf::Harness::with_pool()?;
     let f = PoolFixture::load(FIXTURE);
@@ -126,8 +175,25 @@ fn setup() -> Option<Setup> {
     let payer = Address::new_unique();
     let issuer = Address::new_unique();
     let custodian = Address::new_unique();
-    // The fixture's burns were signed for this pool address.
+    // The fixture's burns were signed for this pool address and this
+    // destination token account.
     let pool = Address::new_from_array(bytes_from_hex(&f.pool));
+    let destination = Address::new_from_array(bytes_from_hex(&f.burns[0].destination));
+    let token_mint = Address::new_unique();
+    let vault = Address::new_unique();
+    let depositor = Address::new_unique();
+    let recipient = Address::new_unique();
+    let total: u64 = f.notes.iter().map(|n| n.value).sum();
+    let config = PoolConfig {
+        custodian,
+        issuer,
+        mint_key: mint_key.0,
+        burn_key: burn_key.0,
+        token_program: token::ID,
+        token_mint,
+        vault,
+    };
+    let vault_authority = pool_ix::find_vault_authority(&pool).0;
     let mut w = World {
         accounts: vec![
             (payer, funded()),
@@ -137,21 +203,23 @@ fn setup() -> Option<Setup> {
             mint_key.clone(),
             burn_key.clone(),
             keyed_account_for_system_program(),
+            token::keyed_account(),
+            (vault, token_account_of(&token_mint, &vault_authority, 0)),
+            (depositor, token_account_of(&token_mint, &payer, total)),
+            (destination, token_account_of(&token_mint, &recipient, 0)),
         ],
         h,
     };
 
     let lamports = w.h.rent_exempt(POOL_ACCOUNT_LEN);
-    let [create, init] = pool_ix::create_pool(
-        &payer,
-        &pool,
-        lamports,
-        &custodian,
-        &issuer,
-        &mint_key.0,
-        &burn_key.0,
-    );
+    let [create, init] = pool_ix::create_pool(&payer, &pool, lamports, &config);
     sbf::assert_success(&w.run(&create));
+
+    // A vault that is not owned by the vault authority is refused.
+    let mut bad = init.clone();
+    bad.accounts[1].pubkey = depositor;
+    assert_pool_error(&w.run(&bad), PoolError::InvalidVaultAccount);
+
     let r = w.run(&init);
     sbf::assert_success(&r);
     println!("InitializePool: {} CUs", r.compute_units_consumed);
@@ -163,11 +231,10 @@ fn setup() -> Option<Setup> {
         w,
         f,
         pool,
+        config,
         payer,
-        issuer,
-        custodian,
-        mint_key: mint_key.0,
-        burn_key: burn_key.0,
+        depositor,
+        destination,
     })
 }
 
@@ -177,8 +244,9 @@ fn mint_ix(s: &Setup, i: usize) -> Instruction {
     assert_eq!(g.public_inputs[0], note.commitment_bytes());
     pool_ix::mint(
         &s.pool,
-        &s.issuer,
-        &s.mint_key,
+        &s.config,
+        &s.depositor,
+        &s.payer,
         proof_bytes(&g.proof.0),
         &note.commitment_bytes(),
         note.value,
@@ -194,6 +262,7 @@ fn mint_all(s: &mut Setup) {
         "empty root on-chain disagrees with light-poseidon"
     );
 
+    let total = s.total();
     let mut expected_supply = 0u64;
     for i in 0..s.f.notes.len() {
         let ix = mint_ix(s, i);
@@ -205,6 +274,9 @@ fn mint_all(s: &mut Setup) {
             assert_eq!(p.next_index(), i as u64 + 1);
             assert_eq!(p.supply(), expected_supply);
         });
+        // The deposit backs the supply.
+        assert_eq!(s.vault_amount(), expected_supply);
+        assert_eq!(token_amount(s.w.get(&s.depositor)), total - expected_supply);
     }
     let root = with_pool(&s.w, &s.pool, |p| *p.current_root());
     assert_eq!(root, bytes_from_hex(&s.f.root), "pool.json root");
@@ -221,6 +293,7 @@ fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
     let note = &s.f.notes[b.index as usize];
     let nullifier = bytes_from_hex(&b.nullifier);
     let destination = Address::new_from_array(bytes_from_hex(&b.destination));
+    assert_eq!(destination, s.destination, "one destination per fixture");
     assert_eq!(g.public_inputs[0], bytes_from_hex(&s.f.root));
     assert_eq!(g.public_inputs[1], nullifier);
     assert_eq!(
@@ -240,9 +313,8 @@ fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
     );
     let mut ix = pool_ix::burn(
         &s.pool,
+        &s.config,
         &s.payer,
-        &s.custodian,
-        &s.burn_key,
         proof_bytes(&g.proof.0),
         &bytes_from_hex(&s.f.root),
         &nullifier,
@@ -274,13 +346,35 @@ fn mint_rejects_wrong_issuer_key_and_tampered_inputs() {
 
     // Not the issuer.
     let mut ix = mint_ix(&s, 0);
-    ix.accounts[1].pubkey = s.custodian;
+    ix.accounts[1].pubkey = s.config.custodian;
     assert_missing_signature(&s.w.run(&ix));
 
     // The burn key is not the mint key.
     let mut ix = mint_ix(&s, 0);
-    ix.accounts[3].pubkey = s.burn_key;
+    ix.accounts[3].pubkey = s.config.burn_key;
     assert_pool_error(&s.w.run(&ix), PoolError::WrongVerifyingKey);
+
+    // Depositing into some other token account than the pool's vault.
+    let mut ix = mint_ix(&s, 0);
+    ix.accounts[6].pubkey = s.destination;
+    assert_pool_error(&s.w.run(&ix), PoolError::WrongVault);
+
+    // Not the pool's token program.
+    let mut ix = mint_ix(&s, 0);
+    ix.accounts[7].pubkey = Address::new_unique();
+    assert_pool_error(&s.w.run(&ix), PoolError::WrongTokenProgram);
+
+    // A depositor who cannot cover the note: the token program's refusal
+    // propagates through the CPI, after the proof verified.
+    let poor = Address::new_unique();
+    s.w.accounts
+        .push((poor, token_account_of(&s.config.token_mint, &s.payer, 0)));
+    let mut ix = mint_ix(&s, 0);
+    ix.accounts[4].pubkey = poor;
+    assert_eq!(
+        s.w.run(&ix).program_result,
+        ProgramResult::Failure(ProgramError::Custom(TOKEN_INSUFFICIENT_FUNDS))
+    );
 
     // Another value than the proof opens to: the verifier's rejection
     // propagates through the CPI.
@@ -289,11 +383,12 @@ fn mint_rejects_wrong_issuer_key_and_tampered_inputs() {
     ix.data[n - 8] ^= 1;
     sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
 
-    // Nothing was appended.
+    // Nothing was appended, nothing deposited.
     with_pool(&s.w, &s.pool, |p| {
         assert_eq!(p.next_index(), 0);
         assert_eq!(p.supply(), 0);
     });
+    assert_eq!(s.vault_amount(), 0);
 }
 
 #[test]
@@ -304,11 +399,15 @@ fn burn_unshield_and_forfeit() {
     let unshield = find_burn(&s, false);
     let forfeit = find_burn(&s, true);
 
-    // Owner unshield: anyone may submit it, no custodian signature.
+    // Owner unshield: anyone may submit it, no custodian signature. The
+    // vault pays the destination.
     let ix = burn_ix(&s, &unshield, false);
     let r = s.w.run(&ix);
     sbf::assert_success(&r);
     println!("Burn (unshield): {} CUs", r.compute_units_consumed);
+    let unshielded = s.f.notes[unshield.index as usize].value;
+    assert_eq!(token_amount(s.w.get(&s.destination)), unshielded);
+    assert_eq!(s.vault_amount(), total - unshielded);
     let nf_account =
         pool_ix::find_nullifier_address(&s.pool, &bytes_from_hex(&unshield.nullifier)).0;
     let nf = s.w.get(&nf_account);
@@ -328,7 +427,7 @@ fn burn_unshield_and_forfeit() {
     assert_missing_signature(&s.w.run(&ix));
     // ...from the custodian, not just anyone.
     let mut ix = burn_ix(&s, &forfeit, true);
-    ix.accounts[6].pubkey = s.issuer;
+    ix.accounts[6].pubkey = s.config.issuer;
     assert_missing_signature(&s.w.run(&ix));
     // With it, the custodian removes the note without the owner's key.
     let ix = burn_ix(&s, &forfeit, true);
@@ -337,6 +436,12 @@ fn burn_unshield_and_forfeit() {
     println!("Burn (forfeit): {} CUs", r.compute_units_consumed);
     let after_forfeit = after_unshield - s.f.notes[forfeit.index as usize].value;
     with_pool(&s.w, &s.pool, |p| assert_eq!(p.supply(), after_forfeit));
+    assert_eq!(s.vault_amount(), after_forfeit);
+    assert_eq!(
+        token_amount(s.w.get(&s.destination)),
+        total - after_forfeit,
+        "the destination received both burns"
+    );
 }
 
 #[test]
@@ -388,13 +493,28 @@ fn burn_rejects_unknown_root_and_tampered_inputs() {
         assert!(r.program_result.is_err(), "wrong {what} accepted");
     }
 
-    // The mempool replay: same proof, another destination. The program
-    // recomputes the sighash from the new destination and the proof, made
-    // over the owner's signature of the old one, no longer verifies.
+    // The mempool replay: same proof, another destination token account.
+    // The program recomputes the sighash from the new destination and the
+    // proof, made over the owner's signature of the old one, no longer
+    // verifies.
     let mut ix = burn_ix(&s, &unshield, false);
-    let dest_off = root_off + 73;
-    ix.data[dest_off..dest_off + 32].copy_from_slice(Address::new_unique().as_array());
+    ix.accounts[8].pubkey = s.depositor;
     sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
+
+    // Paying out of some other token account than the vault.
+    let mut ix = burn_ix(&s, &unshield, false);
+    ix.accounts[7].pubkey = s.depositor;
+    assert_pool_error(&s.w.run(&ix), PoolError::WrongVault);
+
+    // A vault authority that is not the pool's PDA.
+    let mut ix = burn_ix(&s, &unshield, false);
+    ix.accounts[9].pubkey = Address::new_unique();
+    assert_pool_error(&s.w.run(&ix), PoolError::WrongVault);
+
+    // Not the pool's token program.
+    let mut ix = burn_ix(&s, &unshield, false);
+    ix.accounts[10].pubkey = Address::new_unique();
+    assert_pool_error(&s.w.run(&ix), PoolError::WrongTokenProgram);
 
     // The nullifier account must be the PDA for the published nullifier.
     let mut ix = burn_ix(&s, &unshield, false);
@@ -407,6 +527,8 @@ fn burn_rejects_unknown_root_and_tampered_inputs() {
     assert_pool_error(&s.w.run(&ix), PoolError::InvalidForcedFlag);
 
     // Nothing changed.
-    let total: u64 = s.f.notes.iter().map(|n| n.value).sum();
+    let total = s.total();
     with_pool(&s.w, &s.pool, |p| assert_eq!(p.supply(), total));
+    assert_eq!(s.vault_amount(), total);
+    assert_eq!(token_amount(s.w.get(&s.destination)), 0);
 }

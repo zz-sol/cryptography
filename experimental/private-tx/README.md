@@ -223,20 +223,23 @@ their full viewing keys with the custodian, for forfeiture to work.
 
 ## Pool program
 
-`program/` is one shielded pool as a Solana program, written with Pinocchio
-like the verifier. It holds no proof logic: every `Mint` and `Burn` CPIs the
-Groth16 verifier program's `Verify` with the circuit's content-addressed
-verifying-key account, whose address the pool pins at initialization. The
-program decides which public inputs the proof must open to and what to do
-with them.
+`program/` is one shielded pool over one SPL Token mint as a Solana
+program, written with Pinocchio like the verifier. It holds no proof logic:
+every `Mint` and `Burn` CPIs the Groth16 verifier program's `Verify` with
+the circuit's content-addressed verifying-key account, whose address the
+pool pins at initialization. The program decides which public inputs the
+proof must open to and what to do with them: move tokens between the
+depositor, the vault and the destination, append to the tree, record the
+nullifier.
 
-One pool account (4,256 bytes):
+One pool account (4,352 bytes):
 
 | field | what |
 | --- | --- |
 | `custodian`, `issuer` | signers of forced burns and of mints |
 | `mint_key`, `burn_key` | the verifier key accounts of `C_mint` and `C_burn` |
-| `supply` | minted minus burned |
+| `token_program`, `token_mint`, `vault` | the asset and the token account holding its backing, owned by the vault authority PDA `["vault", pool]` |
+| `supply` | minted minus burned; equals the vault balance |
 | `next_index`, `filled[32]`, `zeros[32]` | the incremental Merkle tree (depth 32, `Poseidon(NODE, left, right)` via `sol_poseidon`), the same tree `circuits/merkle` defines |
 | `roots[64]` | ring of recent roots a burn may prove against |
 
@@ -245,26 +248,37 @@ Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
 
 | instruction | accounts | data | effect |
 | --- | --- | --- | --- |
-| `InitializePool` | pool (s, w) | custodian, issuer, mint_key, burn_key | fills the empty tree (32 Poseidon calls), pushes the empty root |
-| `Mint` | pool (w), issuer (s), verifier, mint key | proof, commitment, value | verify `(commitment, value)`; append; `supply += value` |
-| `Burn` | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced) | proof, root, nullifier, value, forced, destination | root ∈ history; `sighash = Poseidon(pool, destination, nullifier, value)`; verify `(root, nullifier, value, forced, sighash)`; create the PDA; `supply -= value` |
+| `InitializePool` | pool (s, w), vault, token program | custodian, issuer, mint_key, burn_key, token_mint | checks the vault is an initialized token account of the mint owned by the vault authority; fills the empty tree (32 Poseidon calls), pushes the empty root |
+| `Mint` (shield) | pool (w), issuer (s), verifier, mint key, source token account (w), source owner (s), vault (w), token program | proof, commitment, value | verify `(commitment, value)`; transfer `value` source → vault (source owner's authority); append; `supply += value` |
+| `Burn` (unshield / forfeit) | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced), vault (w), destination token account (w), vault authority, token program | proof, root, nullifier, value, forced | root ∈ history; `sighash = Poseidon(SIGHASH, pool, destination, nullifier, value)` with the destination account's address; verify `(root, nullifier, value, forced, sighash)`; create the PDA; transfer `value` vault → destination (PDA authority); `supply -= value` |
 
-Compute units under Mollusk (SBF v2, local): `InitializePool` 37.6k; `Mint`
-122k, of which 82.8k is the verifier CPI and the rest is mostly the 32
-Poseidon syscalls of the append; `Burn` 100k (unshield or forfeit), five
-public inputs plus the sighash syscall.
+The destination of a burn is a token account named in the instruction, and
+the sighash the owner signed names it too, so the vault can only ever pay
+the account the proof was made for. The issuer co-signs every shield: who
+may bring assets into an institution's pool is the institution's business,
+and the deposit itself is the depositor's own token transfer, so the issuer
+cannot shield someone else's funds.
 
-What it does not do yet: no vault, so `Mint` and `Burn` only move the supply
-counter and the token boundary (deposit on mint, withdrawal to `destination`
-on burn) is missing; the program id is a placeholder.
+Compute units under Mollusk (SBF v2, local): `InitializePool` 39.3k; `Mint`
+123k, of which 82.8k is the verifier CPI and the rest is mostly the 32
+Poseidon syscalls of the append plus the token transfer; `Burn` 103k
+(unshield or forfeit), five public inputs plus the sighash syscall and the
+token transfer.
+
+What it does not do yet: `Transfer` (waits for `C_transfer`); Token-2022
+extensions are untested (the layout check and `Transfer` are the same, but
+transfer fees or hooks would break the supply/vault equality); the program
+id is a placeholder.
 
 The e2e test `e2e/tests/pool.rs` replays `fixtures/pool/`: it registers both
 keys, creates a pool, mints every note and checks the on-chain root against
 the fixture's and against a light-poseidon tree over the same leaves, then
-burns one note as its owner and forfeits another as the custodian, and
-checks every rejection (replayed nullifier, unknown root, forfeiture without
-the custodian, the same proof with another destination, tampered public
-inputs, wrong key, wrong PDA).
+burns one note as its owner and forfeits another as the custodian, with
+the vault and the destination token account's balances checked after every
+step, and checks every rejection (replayed nullifier, unknown root,
+forfeiture without the custodian, the same proof with another destination,
+wrong vault or token program, a depositor who cannot cover the note,
+tampered public inputs, wrong key, wrong PDA).
 
 ## Circuit rules
 
@@ -318,7 +332,7 @@ no tag newer than the required commit, so it stays on that commit.
 - Outgoing viewing keys and note encryption to the recipient and the
   auditor (the key hierarchy above already gives `ivk` for the key
   agreement).
-- Pool program: vault (token boundary), `Transfer` once `C_transfer` exists,
-  a real program id.
+- Pool program: `Transfer` once `C_transfer` exists, a real program id,
+  Token-2022 coverage.
 - Client glue: Merkle path tracking from chain state, proving, transaction
   assembly (Epic 4).

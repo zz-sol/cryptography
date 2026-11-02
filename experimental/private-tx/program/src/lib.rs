@@ -14,9 +14,10 @@
 //! public inputs the proof must open to and what to do with them.
 //!
 //! Instruction data is `tag ‖ payload`; see [`instruction`] (host side) and
-//! [`processor`] for the exact layouts. Milestone-1 scope: no vault, so
-//! `Mint` and `Burn` move only the pool's supply counter; a token boundary
-//! and destination binding come with the spec.
+//! [`processor`] for the exact layouts. The pool wraps one SPL Token mint:
+//! `Mint` is a shield (the depositor's tokens move into the pool's vault,
+//! a note is created) and `Burn` an unshield or forfeiture (the vault pays
+//! the destination the proof was made for).
 
 pub mod error;
 pub mod processor;
@@ -35,8 +36,8 @@ pub const ID: Address = Address::from_str_const("3sDoL7Tan84VmueUVRp1NRkhfPRF2z5
 pub const VERIFIER_ID: Address =
     Address::from_str_const("GrPeAM83MtRfR8NvbW3tMMSBzQ9BsmQrgLjLCQNwZW4P");
 
-/// `Burn` takes seven accounts; nothing takes more.
-pub const MAX_ACCOUNTS: usize = 7;
+/// `Burn` takes eleven accounts; nothing takes more.
+pub const MAX_ACCOUNTS: usize = 11;
 
 #[cfg(all(
     any(target_os = "solana", target_arch = "bpf"),
