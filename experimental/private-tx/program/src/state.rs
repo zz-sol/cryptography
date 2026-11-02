@@ -227,3 +227,37 @@ pub fn u64_to_field(v: u64) -> [u8; 32] {
     out[24..].copy_from_slice(&v.to_be_bytes());
     out
 }
+
+/// A 32-byte address as two field elements, its 128-bit big-endian halves:
+/// addresses do not fit one BN254 scalar.
+pub fn address_halves(a: &[u8; 32]) -> [[u8; 32]; 2] {
+    let mut hi = [0u8; 32];
+    let mut lo = [0u8; 32];
+    hi[16..].copy_from_slice(&a[..16]);
+    lo[16..].copy_from_slice(&a[16..]);
+    [hi, lo]
+}
+
+/// The burn sighash the owner signs and `C_burn` takes as its last public
+/// input (`circuits/burn.SigHash`):
+///
+/// ```text
+/// Poseidon(pool[0:16], pool[16:32], destination[0:16], destination[16:32], nullifier, value)
+/// ```
+pub fn burn_sighash(
+    pool: &[u8; 32],
+    destination: &[u8; 32],
+    nullifier: &[u8; 32],
+    value: u64,
+) -> Result<[u8; 32], ProgramError> {
+    let [p0, p1] = address_halves(pool);
+    let [d0, d1] = address_halves(destination);
+    let v = u64_to_field(value);
+    hashv(
+        Parameters::Bn254X5,
+        Endianness::BigEndian,
+        &[&p0, &p1, &d0, &d1, nullifier, &v],
+    )
+    .map(|h| h.to_bytes())
+    .map_err(|_| PoolError::PoseidonFailed.into())
+}

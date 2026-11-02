@@ -65,9 +65,11 @@ cm   = Poseidon(value, owner_pk, rho, r)        // width 5
 ```
 
 - `value`: `u64`.
-- `owner_pk`: the recipient's key as an opaque field element. The key
-  hierarchy is spec work (Epic 1); fixtures use the provisional
-  `owner_pk = Poseidon(sk)`.
+- `owner_pk = Poseidon(ak.x, ak.y)`: the hash of the recipient's spend
+  authorizing key `ak`, a point on the twisted Edwards curve over BN254 Fr
+  (Baby Jubjub, in gnark-crypto's `a = -1` form). The rest of the key
+  hierarchy (nullifier key, viewing keys, diversified addresses) is spec work
+  (Epic 1).
 - `rho`: per-note uniqueness, the nullifier input.
 - `r`: commitment randomness.
 
@@ -141,29 +143,55 @@ releases the amount (vault withdrawal, supply decrease).
 
 | | |
 | --- | --- |
-| public inputs | `root`, `nullifier`, `value`, `forced` (in that order) |
-| witness | `owner_pk`, `rho`, `r`, `sk`, leaf index, 32 Merkle siblings |
-| constraints | `forced ∈ {0, 1}`; `forced ∨ owner_pk = Poseidon(sk)`; `commitment = Poseidon(value, owner_pk, rho, r)`; `root = MerkleRoot(commitment, index, siblings)`; `nullifier = Poseidon(owner_pk, rho)` |
-| size | 8532 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+| public inputs | `root`, `nullifier`, `value`, `forced`, `sighash` (in that order) |
+| witness | `ak`, `rho`, `r`, signature `(R, S)`, leaf index, 32 Merkle siblings |
+| constraints | `forced ∈ {0, 1}`; `owner_pk = Poseidon(ak)`; `forced ∨ EdDSA.Verify(ak, sighash, (R, S))`; `commitment = Poseidon(value, owner_pk, rho, r)`; `root = MerkleRoot(commitment, index, siblings)`; `nullifier = Poseidon(owner_pk, rho)` |
+| size | 16327 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
 
-- `forced = 0`, unshield: the proof shows knowledge of the owner's spending
-  key, so it carries the owner's consent and the program accepts it from
-  anyone.
-- `forced = 1`, forfeiture: no ownership check, the "alternative
+Authorization follows Zcash. Spending is a **spend authorization signature**
+by the owner's key over a **sighash** of the transaction, not knowledge of a
+secret inside the proof. The sighash is
+
+```
+sighash = Poseidon(pool[0:16], pool[16:32], destination[0:16], destination[16:32], nullifier, value)
+```
+
+(Solana addresses are 256 bits, so each is two 128-bit halves.) The pool
+program recomputes it from the instruction it is executing and passes it as
+the last public input, so a proof is good for exactly one pool and one
+destination: a copy fished out of the mempool with the recipient swapped
+fails verification. Root and `forced` are public inputs of the same proof,
+so the hash need not repeat them.
+
+One deviation from Zcash: the signature is verified **inside the circuit**,
+not on-chain. Zcash publishes a re-randomized key `rk` and checks the
+signature in the transaction; Solana has no syscall for Baby Jubjub, so that
+check would cost on the order of a million compute units in software, more
+than ten proof verifications. In-circuit it costs about 7,800 constraints
+(gnark's `std/signature/eddsa` with its MiMC challenge hash, which never
+needs to match anything on-chain), and nothing about the key, not even a
+re-randomization, is ever published. What Zcash's split buys is kept: the
+prover needs `ak` and the signature, never the spending key, so proving and
+signing can run on different machines (an HSM signs, a prover box proves).
+What is lost is proving before the transaction is final, since the sighash is
+a public input.
+
+- `forced = 0`, unshield: the proof carries the owner's signature over this
+  transaction, so the program accepts it from anyone.
+- `forced = 1`, forfeiture: no signature check, the "alternative
   nullifier-authorization path" the design left open. The custodian learns
-  the opening from the audit ciphertext and removes the note without the
-  owner's key. The program must require the custodian's signature whenever
-  the flag is set; the circuit only tells it which case it is in.
+  the opening (including `ak`) from the audit ciphertext and removes the note
+  without the owner's key; the witness carries a well-formed dummy signature
+  the circuit ignores. The program must require the custodian's signature
+  whenever the flag is set; the circuit only tells it which case it is in.
 
 No range check on `value`: it is bound to a leaf, and every leaf was
 range-checked by the circuit that created it. The root is checked by the
 program against its root history. `C_transfer`'s spend side is this relation
-with `forced = 0`.
+with `forced = 0` and the output notes in place of `destination`.
 
-Two spec items this depends on: the audit ciphertext must carry the full
-opening (`owner_pk`, `rho`, `r`), not only the value, for forfeiture to work;
-and the statement should bind where the released amount goes, so a proof
-cannot be replayed from the mempool with another recipient.
+One spec item this depends on: the audit ciphertext must carry the full
+opening (`ak`, `rho`, `r`), not only the value, for forfeiture to work.
 
 ## Pool program
 
@@ -191,24 +219,24 @@ Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
 | --- | --- | --- | --- |
 | `InitializePool` | pool (s, w) | custodian, issuer, mint_key, burn_key | fills the empty tree (32 Poseidon calls), pushes the empty root |
 | `Mint` | pool (w), issuer (s), verifier, mint key | proof, commitment, value | verify `(commitment, value)`; append; `supply += value` |
-| `Burn` | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced) | proof, root, nullifier, value, forced | root ∈ history; verify `(root, nullifier, value, forced)`; create the PDA; `supply -= value` |
+| `Burn` | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced) | proof, root, nullifier, value, forced, destination | root ∈ history; `sighash = Poseidon(pool, destination, nullifier, value)`; verify `(root, nullifier, value, forced, sighash)`; create the PDA; `supply -= value` |
 
 Compute units under Mollusk (SBF v2, local): `InitializePool` 27.7k; `Mint`
 112k, of which 82.8k is the verifier CPI and the rest is mostly the 32
-Poseidon syscalls of the append; `Burn` 91.6k (unshield) / 93.5k (forfeit).
+Poseidon syscalls of the append; `Burn` 105k (unshield) / 101k (forfeit),
+five public inputs plus the sighash syscall.
 
-What it does not do yet, all spec items: no vault, so `Mint` and `Burn`
-only move the supply counter and the token boundary (deposit on mint,
-withdrawal on burn) is missing; the burn statement does not bind where the
-released amount goes, so a proof could be replayed from the mempool with
-another payer; the program id is a placeholder.
+What it does not do yet: no vault, so `Mint` and `Burn` only move the supply
+counter and the token boundary (deposit on mint, withdrawal to `destination`
+on burn) is missing; the program id is a placeholder.
 
 The e2e test `e2e/tests/pool.rs` replays `fixtures/pool/`: it registers both
 keys, creates a pool, mints every note and checks the on-chain root against
 the fixture's and against a light-poseidon tree over the same leaves, then
 burns one note as its owner and forfeits another as the custodian, and
 checks every rejection (replayed nullifier, unknown root, forfeiture without
-the custodian, tampered public inputs, wrong key, wrong PDA).
+the custodian, the same proof with another destination, tampered public
+inputs, wrong key, wrong PDA).
 
 ## Circuit rules
 
@@ -259,9 +287,9 @@ no tag newer than the required commit, so it stays on that commit.
 - `C_transfer`: spend side = `C_burn` with `forced = 0`; 2-in/2-out
   conservation, auditor ciphertexts (Baby Jubjub ElGamal gadget), and note
   encryption to the recipient, without which a transfer cannot be received.
-- Key hierarchy, domain separation of the Poseidon uses, and destination
-  binding of `C_burn` in the spec; these change public inputs, so they come
-  before the pool program grows.
+- The rest of the key hierarchy (nullifier key, viewing keys, diversified
+  addresses) and domain separation of the Poseidon uses in the spec; these
+  change public inputs, so they come before the pool program grows.
 - Pool program: vault (token boundary), `Transfer` once `C_transfer` exists,
   a real program id.
 - Client glue: Merkle path tracking from chain state, proving, transaction

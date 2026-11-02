@@ -62,7 +62,7 @@ func Assignment(n *note.Note) *Circuit {
 	return &Circuit{
 		Commitment: n.Commitment(),
 		Value:      n.Value,
-		OwnerPK:    n.OwnerPK,
+		OwnerPK:    n.OwnerPK(),
 		Rho:        n.Rho,
 		R:          n.R,
 	}

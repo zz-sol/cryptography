@@ -22,11 +22,11 @@ const NbConstraints = 363
 
 func randomNote(t *testing.T, value uint64) note.Note {
 	t.Helper()
-	var sk fr.Element
-	if _, err := sk.SetRandom(); err != nil {
+	k, err := note.GenerateSpendingKey(rand.Reader)
+	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := note.Random(rand.Reader, value, note.DeriveOwnerPK(sk))
+	n, err := note.Random(rand.Reader, value, k.Owner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestMintCircuit(t *testing.T) {
 func commitmentOf(value *big.Int, n *note.Note) fr.Element {
 	var v fr.Element
 	v.SetBigInt(value)
-	return poseidon.MustHash(v, n.OwnerPK, n.Rho, n.R)
+	return poseidon.MustHash(v, n.OwnerPK(), n.Rho, n.R)
 }
 
 func TestZeroValueNoteIsValid(t *testing.T) {

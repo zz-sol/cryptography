@@ -16,15 +16,20 @@ import (
 
 // NbConstraints is the R1CS size of the circuit as compiled by the pinned gnark
 // and Poseidon gadget versions; quoted in README.md.
-const NbConstraints = 8532
+const NbConstraints = 16327
+
+var (
+	testPool        = [32]byte{1, 2, 3}
+	testDestination = [32]byte{4, 5, 6}
+)
 
 // pool builds a tree of n seeded notes and returns it with the notes and
 // their spending keys.
-func pool(t *testing.T, n int) (*merkle.Tree, []note.Note, []fr.Element) {
+func pool(t *testing.T, n int) (*merkle.Tree, []note.Note, []note.SpendingKey) {
 	t.Helper()
 	var tr merkle.Tree
 	notes := make([]note.Note, n)
-	keys := make([]fr.Element, n)
+	keys := make([]note.SpendingKey, n)
 	for i := range notes {
 		seed := []byte{byte(i)}
 		notes[i] = note.FromSeed(seed, uint64(100*(i+1)))
@@ -36,6 +41,15 @@ func pool(t *testing.T, n int) (*merkle.Tree, []note.Note, []fr.Element) {
 	return &tr, notes, keys
 }
 
+func unshield(t *testing.T, n *note.Note, path *merkle.Path, k note.SpendingKey) *Circuit {
+	t.Helper()
+	c, err := Unshield(n, path, k, testPool, testDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func TestBurnCircuit(t *testing.T) {
 	tr, notes, keys := pool(t, 4)
 	target := 2
@@ -44,54 +58,76 @@ func TestBurnCircuit(t *testing.T) {
 		t.Fatal(err)
 	}
 	n, sk := notes[target], keys[target]
-	unshield := Unshield(&n, &path, sk)
-	forfeit := Forfeit(&n, &path)
+	valid := unshield(t, &n, &path, sk)
+	forfeit := Forfeit(&n, &path, testPool, testDestination)
 	if root, got := tr.Root(), path.Root(n.Commitment()); !got.Equal(&root) {
 		t.Fatal("assignment root != tree root")
 	}
 
-	// Unshield with another note's key: no consent.
-	wrongKey := Unshield(&n, &path, keys[0])
+	// Signed by another note's owner: no consent.
+	wrongKey := unshield(t, &n, &path, keys[0])
+
+	// The owner's signature over another destination: a replay with the
+	// recipient swapped.
+	otherDestination := unshield(t, &n, &path, sk)
+	otherDestination.SigHash = SigHash(testPool, [32]byte{9}, n.Nullifier(), n.Value)
+
+	// The owner's signature over the same destination in another pool.
+	otherPool := unshield(t, &n, &path, sk)
+	otherPool.SigHash = SigHash([32]byte{9}, testDestination, n.Nullifier(), n.Value)
+
+	// Unshield with the forfeiture's dummy signature.
+	noSignature := Forfeit(&n, &path, testPool, testDestination)
+	noSignature.Forced = 0
 
 	// Forced with a bogus flag value.
-	notBoolean := Forfeit(&n, &path)
+	notBoolean := Forfeit(&n, &path, testPool, testDestination)
 	notBoolean.Forced = 2
 
 	// A note that is not in the tree.
 	outsider := note.FromSeed([]byte("not in the pool"), 100)
-	notInTree := Forfeit(&outsider, &path)
+	notInTree := Forfeit(&outsider, &path, testPool, testDestination)
 	notInTree.Root = tr.Root()
 
 	// The right note with a stale (different) root.
-	wrongRoot := Forfeit(&n, &path)
+	wrongRoot := Forfeit(&n, &path, testPool, testDestination)
 	wrongRoot.Root = merkle.EmptyRoot()
 
 	// Public value disagrees with the committed one.
-	wrongValue := Unshield(&n, &path, sk)
+	wrongValue := unshield(t, &n, &path, sk)
 	wrongValue.Value = n.Value + 1
 
 	// Nullifier of another note.
-	wrongNullifier := Forfeit(&n, &path)
+	wrongNullifier := Forfeit(&n, &path, testPool, testDestination)
 	wrongNullifier.Nullifier = notes[0].Nullifier()
+
+	// Another owner key with the same note: owner_pk no longer matches.
+	wrongOwner := Forfeit(&n, &path, testPool, testDestination)
+	other := keys[0].Owner()
+	wrongOwner.Owner = note.OwnerVars(&other)
 
 	// Path of another leaf.
 	otherPath, err := tr.Path(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongPath := Unshield(&n, &otherPath, sk)
+	wrongPath := unshield(t, &n, &otherPath, sk)
 	wrongPath.Root = tr.Root()
 
 	assert := test.NewAssert(t)
 	assert.CheckCircuit(&Circuit{},
-		test.WithValidAssignment(unshield),
+		test.WithValidAssignment(valid),
 		test.WithValidAssignment(forfeit),
 		test.WithInvalidAssignment(wrongKey),
+		test.WithInvalidAssignment(otherDestination),
+		test.WithInvalidAssignment(otherPool),
+		test.WithInvalidAssignment(noSignature),
 		test.WithInvalidAssignment(notBoolean),
 		test.WithInvalidAssignment(notInTree),
 		test.WithInvalidAssignment(wrongRoot),
 		test.WithInvalidAssignment(wrongValue),
 		test.WithInvalidAssignment(wrongNullifier),
+		test.WithInvalidAssignment(wrongOwner),
 		test.WithInvalidAssignment(wrongPath),
 		test.WithCurves(ecc.BN254),
 		test.WithBackends(backend.GROTH16),
@@ -107,16 +143,34 @@ func TestEveryLeafIsBurnable(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := test.IsSolved(&Circuit{}, Unshield(&notes[i], &path, keys[i]), ecc.BN254.ScalarField()); err != nil {
+		if err := test.IsSolved(&Circuit{}, unshield(t, &notes[i], &path, keys[i]), ecc.BN254.ScalarField()); err != nil {
 			t.Fatalf("unshield leaf %d: %v", i, err)
 		}
-		if err := test.IsSolved(&Circuit{}, Forfeit(&notes[i], &path), ecc.BN254.ScalarField()); err != nil {
+		if err := test.IsSolved(&Circuit{}, Forfeit(&notes[i], &path, testPool, testDestination), ecc.BN254.ScalarField()); err != nil {
 			t.Fatalf("forfeit leaf %d: %v", i, err)
 		}
 	}
 }
 
-// The verifying key must be plain Groth16: no commitment keys, four public inputs.
+func TestSigHashBindsEveryField(t *testing.T) {
+	n := note.FromSeed([]byte("sighash"), 7)
+	base := SigHash(testPool, testDestination, n.Nullifier(), n.Value)
+	variants := []fr.Element{
+		SigHash([32]byte{1, 2, 4}, testDestination, n.Nullifier(), n.Value),
+		SigHash([32]byte{1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, testDestination, n.Nullifier(), n.Value),
+		SigHash(testPool, [32]byte{4, 5, 7}, n.Nullifier(), n.Value),
+		SigHash(testPool, [32]byte{4, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, n.Nullifier(), n.Value),
+		SigHash(testPool, testDestination, n.Commitment(), n.Value),
+		SigHash(testPool, testDestination, n.Nullifier(), n.Value+1),
+	}
+	for i, v := range variants {
+		if v.Equal(&base) {
+			t.Errorf("variant %d did not change the sighash", i)
+		}
+	}
+}
+
+// The verifying key must be plain Groth16: no commitment keys, five public inputs.
 func TestVerifyingKeyShape(t *testing.T) {
 	ccs, err := Compile()
 	if err != nil {
@@ -127,8 +181,8 @@ func TestVerifyingKeyShape(t *testing.T) {
 	if got := ccs.GetNbConstraints(); got != NbConstraints {
 		t.Fatalf("constraints = %d, want %d (update NbConstraints and README.md)", got, NbConstraints)
 	}
-	if got := ccs.GetNbPublicVariables(); got != 5 { // "one" wire + root + nullifier + value + forced
-		t.Fatalf("public variables = %d, want 5", got)
+	if got := ccs.GetNbPublicVariables(); got != 6 { // "one" wire + root + nullifier + value + forced + sighash
+		t.Fatalf("public variables = %d, want 6", got)
 	}
 	if n := len(ccs.GetCommitments().CommitmentIndexes()); n != 0 {
 		t.Fatalf("circuit declares %d commitments; the on-chain verifier rejects them", n)
@@ -142,7 +196,7 @@ func TestVerifyingKeyShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []*Circuit{Unshield(&notes[1], &path, keys[1]), Forfeit(&notes[1], &path)} {
+	for _, c := range []*Circuit{unshield(t, &notes[1], &path, keys[1]), Forfeit(&notes[1], &path, testPool, testDestination)} {
 		w, err := frontend.NewWitness(c, ecc.BN254.ScalarField())
 		if err != nil {
 			t.Fatal(err)
@@ -158,9 +212,9 @@ func TestVerifyingKeyShape(t *testing.T) {
 		if err := groth16.Verify(proof, vk, pub); err != nil {
 			t.Fatal(err)
 		}
-		// Public witness order is root, nullifier, value, forced.
+		// Public witness order is root, nullifier, value, forced, sighash.
 		vec, ok := pub.Vector().(fr.Vector)
-		if !ok || len(vec) != 4 {
+		if !ok || len(vec) != 5 {
 			t.Fatalf("public witness vector = %v", pub.Vector())
 		}
 		if root := tr.Root(); !vec[0].Equal(&root) {
@@ -174,6 +228,9 @@ func TestVerifyingKeyShape(t *testing.T) {
 		}
 		if !vec[3].IsUint64() || vec[3].Uint64() != uint64(c.Forced.(int)) {
 			t.Fatalf("public input 3 is not forced = %v", c.Forced)
+		}
+		if sh := SigHash(testPool, testDestination, notes[1].Nullifier(), notes[1].Value); !vec[4].Equal(&sh) {
+			t.Fatal("public input 4 is not the sighash")
 		}
 	}
 }

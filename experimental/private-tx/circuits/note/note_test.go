@@ -13,9 +13,11 @@ import (
 )
 
 func TestCommitmentBindsEveryField(t *testing.T) {
-	var pk fr.Element
-	pk.SetUint64(7)
-	n, err := Random(rand.Reader, 1000, pk)
+	k, err := GenerateSpendingKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := Random(rand.Reader, 1000, k.Owner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +25,7 @@ func TestCommitmentBindsEveryField(t *testing.T) {
 
 	variants := []Note{n, n, n, n}
 	variants[0].Value++
-	variants[1].OwnerPK.SetUint64(8)
+	variants[1].Owner = SpendingKeyFromSeed([]byte("someone else")).Owner()
 	variants[2].Rho.Add(&variants[2].Rho, new(fr.Element).SetOne())
 	variants[3].R.Add(&variants[3].R, new(fr.Element).SetOne())
 	for i, v := range variants {
@@ -48,9 +50,36 @@ func TestNullifierBindsOwnerAndRho(t *testing.T) {
 		t.Fatal("nullifier ignores rho")
 	}
 	other = n
-	other.OwnerPK.Add(&other.OwnerPK, new(fr.Element).SetOne())
+	other.Owner = SpendingKeyFromSeed([]byte("someone else")).Owner()
 	if got := other.Nullifier(); got.Equal(&nf) {
 		t.Fatal("nullifier ignores owner_pk")
+	}
+}
+
+func TestSignatureVerifiesNatively(t *testing.T) {
+	k := SpendingKeyFromSeed([]byte("signer"))
+	var msg fr.Element
+	msg.SetUint64(12345)
+	sig, err := k.Sign(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sig.R.IsOnCurve() {
+		t.Fatal("R is not on the curve")
+	}
+	if sig.S.IsZero() {
+		t.Fatal("S is zero")
+	}
+	again, err := k.Sign(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != sig {
+		t.Fatal("signing is not deterministic")
+	}
+	d := Dummy()
+	if !d.R.IsOnCurve() || !d.S.IsZero() {
+		t.Fatal("dummy signature is malformed")
 	}
 }
 
@@ -60,8 +89,11 @@ func TestFromSeedIsDeterministic(t *testing.T) {
 	if a != b {
 		t.Fatal("same seed gave different notes")
 	}
-	if pk := DeriveOwnerPK(SpendingKeyFromSeed([]byte("seed"))); !pk.Equal(&a.OwnerPK) {
+	if ak := SpendingKeyFromSeed([]byte("seed")).Owner(); !ak.Equal(&a.Owner) {
 		t.Fatal("SpendingKeyFromSeed does not own the seeded note")
+	}
+	if !a.Owner.IsOnCurve() || !a.Owner.IsInSubGroup() {
+		t.Fatal("seeded owner key is not a valid public key")
 	}
 	c := FromSeed([]byte("other"), 5)
 	if a == c {
@@ -90,6 +122,14 @@ func TestOpeningRoundTrip(t *testing.T) {
 	o.Value++
 	if _, err := FromOpening(o); err == nil {
 		t.Fatal("tampered opening accepted")
+	}
+	o = Opening{}
+	if err := json.Unmarshal(data, &o); err != nil {
+		t.Fatal(err)
+	}
+	o.OwnerPK = o.Rho
+	if _, err := FromOpening(o); err == nil {
+		t.Fatal("opening with owner_pk != Poseidon(owner_ak) accepted")
 	}
 	if len(o.Commitment) != 66 {
 		t.Fatalf("commitment hex is %d chars, want 66", len(o.Commitment))

@@ -3,22 +3,28 @@
 //!
 //! Accounts: `[pool (w), payer (s, w), nullifier PDA (w), system program,
 //! verifier program, burn key, custodian]`.
-//! Data: `proof (256) ‖ root (32) ‖ nullifier (32) ‖ value (u64 LE) ‖ forced (1)`.
+//! Data: `proof (256) ‖ root (32) ‖ nullifier (32) ‖ value (u64 LE) ‖ forced (1) ‖ destination (32)`.
 //!
 //! The proof is `C_burn` with public inputs `(root, nullifier, value,
-//! forced)`. The root must be in the pool's history; the nullifier PDA
-//! (`["nullifier", pool, nullifier]`) must not exist yet and is created
-//! here, which is what records the spend; `forced = 1` additionally needs
-//! the custodian's signature, since the circuit then proves no ownership.
-//! `value` leaves the supply. Where it goes is not yet bound (no vault in
-//! this milestone); the spec adds the destination to the statement.
+//! forced, sighash)`, where `sighash = Poseidon(pool, destination,
+//! nullifier, value)` is recomputed here from the instruction. For an
+//! unshield the circuit checked the owner's signature over that sighash, so
+//! the proof is only good for this pool and this destination: a copy with
+//! another destination fails verification. The root must be in the pool's
+//! history; the nullifier PDA (`["nullifier", pool, nullifier]`) must not
+//! exist yet and is created here, which is what records the spend;
+//! `forced = 1` additionally needs the custodian's signature, since the
+//! circuit then checks no owner signature. `value` leaves the supply; with
+//! no vault in this milestone, `destination` is recorded in the statement
+//! but nothing is transferred to it yet.
 
 use {
     super::{expect_owned_by, expect_signer, expect_verifier, expect_writable, take, verify_proof},
     crate::{
         error::PoolError,
         state::{
-            u64_to_field, Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR, NULLIFIER_SEED,
+            burn_sighash, u64_to_field, Pool, NULLIFIER_ACCOUNT_LEN, NULLIFIER_DISCRIMINATOR,
+            NULLIFIER_SEED,
         },
     },
     pinocchio::{
@@ -53,6 +59,7 @@ pub fn process(
     let (nullifier, rest) = take::<32>(rest)?;
     let (value, rest) = take::<8>(rest)?;
     let (forced, rest) = take::<1>(rest)?;
+    let (destination, rest) = take::<32>(rest)?;
     if !rest.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -93,6 +100,7 @@ pub fn process(
         return Err(PoolError::NullifierAlreadySpent.into());
     }
 
+    let sighash = burn_sighash(pool.address().as_array(), destination, nullifier, value)?;
     verify_proof(
         key,
         proof,
@@ -101,6 +109,7 @@ pub fn process(
             *nullifier,
             u64_to_field(value),
             u64_to_field(forced as u64),
+            sighash,
         ],
     )?;
 

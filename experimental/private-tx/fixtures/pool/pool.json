@@ -1,55 +1,70 @@
 {
   "depth": 32,
+  "pool": "0xc55f2ffa9c6f65814a6e84687ab63bc27b7835dbbcc3d351096753466b2a50a3",
   "notes": [
     {
       "value": 1000000,
-      "owner_pk": "0x246efd92c2d2339f4a41f3a5f268db56c0a4c573b5e7b8560ae8f12052b4edc5",
+      "owner_ak_x": "0x2171d454f2317cc619b51227d46a216903338b52cc2f969d7c1afa83587fdf45",
+      "owner_ak_y": "0x24b7f9ddff3ea8fe5393a674f4d7ea7a2b65e9d53023bdbf7135e86e875d2c78",
+      "owner_pk": "0x2ace7b3ee1b18983857fcad121533debf2cc35b1a0513ec137088de013f2fa55",
       "rho": "0x03e5a5e938a2f56c8306b26d5125da9af095b0079a09da8d888c684f4e3d81aa",
       "r": "0x0df20ded14577b5e267bbcffc02c7286ce0a3105e337bc8afe45f2aed16ebc38",
-      "commitment": "0x08cb6e22cbde49038c2361fb35b465453d2466cb0c8657351f28b23dd6ffe623"
+      "commitment": "0x1a52907251f2835372a051d67c20965c0862e8a7c84c8c0080fae04422606389"
     },
     {
       "value": 2000000,
-      "owner_pk": "0x06b9f3fc8f5dec28fdf5ee62334074bb776645aaabad0ba0363afdf84d1804a4",
+      "owner_ak_x": "0x0c1ec116143b2cc478945be15790a65ae8c8d364d433b2ac0d6d6a255f8c713c",
+      "owner_ak_y": "0x2183c715cbc8ba0f851fdc3524caccc24268d0280f7657f5af4e30276379b2a3",
+      "owner_pk": "0x08b0f3edd033570dc92983d7a7f25c524be2ccca548f199e21bc78ae58cb4754",
       "rho": "0x07bf9ac79b2d0728782de8ad63b44990f7b5096a8d07b05b695fa981721eaf74",
       "r": "0x1ac25424899bf343df10526893fec122dc3ed6acb5bbeb1ce50151cfcefc0f38",
-      "commitment": "0x1ca37ec6d397da185242fdda3afce37115be9c9866ccc85751b5dd189d06cf7d"
+      "commitment": "0x282599d30d0fc24cdf085a9f08102ddcc4a2d2f4c0ef5dc7b849ec65ffcbfbfe"
     },
     {
       "value": 3000000,
-      "owner_pk": "0x285a2f4eaa3f7c0425f1358fff86e8539992a6f488a773edef220be35d02af26",
+      "owner_ak_x": "0x0d1b7c372b87faab182caf67997d4d2df6325dc9348625f0c62367b81493e476",
+      "owner_ak_y": "0x0860dc59934cb115e95f0f497c701e60f0049dce3df96b0c59eeea8a0ebb0630",
+      "owner_pk": "0x1650d85d63e94983c9ab1630e93f89c3df9002e02cc69583e811ab3d846b356b",
       "rho": "0x2412cba43b88d8e4d5eb760baf3a9ae26aa1f177f7dd7d0786d13e7b2f450bb8",
       "r": "0x2c22abddba58ee0c5acaa2b31db132f787d3c9a1af5ab7602fbdbe1ba9e046e6",
-      "commitment": "0x14a0986e00ea2abbb74069ba0a2c410f1e8a49c2339f48518649511f9040269a"
+      "commitment": "0x174c2fe60106f418f7eef1dc95b16e3967a75aa670008229c2e6d5758081a693"
     },
     {
       "value": 4000000,
-      "owner_pk": "0x1add1d6793168460bb3131f8a7490e33a02620923f49497168dd2b86a7d926f4",
+      "owner_ak_x": "0x0dc0b27d29b5fb021f192faa4fdd7cafe90365bb4ac6d869de051c890f7f64db",
+      "owner_ak_y": "0x3055be6bedbeb43d93b1eb3e221c1a8d884a1e99c36f2b1fed8a32124375f414",
+      "owner_pk": "0x094bb18a6f4d720dc00bbd2a209d41368b4cef2bb15f5ea962679f35a67d115d",
       "rho": "0x2267c6af1e3bff0796037653b17987c428115777ec4d9520bbc85aa717764c8b",
       "r": "0x1fd083672e4798ffe450f576bcdd2666970475766a2ee68140f0d71fcbe461d5",
-      "commitment": "0x22a4824fe20909c8bde054807979863aef75d57d61a133498f6595d73efd2b1b"
+      "commitment": "0x209e518971b38cbcbae84711ef3a4c5779d186c91e37389feef77e063ff9f5eb"
     },
     {
       "value": 5000000,
-      "owner_pk": "0x10e9f12e6aab4a5882ab1d9f5900489a216cdf89a9b4cab65719cf80928f2449",
+      "owner_ak_x": "0x2c9446f570f6d87303add9c4e1cc765ebfddb51ff1e50e950e7244c5bced86d6",
+      "owner_ak_y": "0x17f49d10c20874b65489a6f640978e428bc099be511b3a046bf22b8de339c3e4",
+      "owner_pk": "0x22e7bf65aab92b0a0356d8036a564316ca8d94d1ba13f4e850685e9e2d320243",
       "rho": "0x01561c9d3d10481c45bb8cf24693d29cf9f839ea86c0fb1685e454aadc3f7de3",
       "r": "0x0f038dd93fe04873223f37ef4c401c88ed95451ada485ff84d11e5be6fb04422",
-      "commitment": "0x1f6d9af153f0f665ad6233c479e82673b1dee14edc9ad987cfe2ba55f974c772"
+      "commitment": "0x0f47adbc983dbf3ad9b1fe4c61590eebe5f533012ded379d7aef2ba79cfb5bdd"
     }
   ],
-  "root": "0x27b9d9c8a820676e36bb12327038d129bd6d4b5faacba482582aa4a230078976",
+  "root": "0x1f93e951f4c150e3b406885911779153d5c2943cd15192bf8046f57db2d04917",
   "burns": [
     {
       "name": "unshield",
       "index": 2,
-      "nullifier": "0x2e171c7d040c492efdeb74ee7f8d445f788e5ef059059931faa710f48da54113",
-      "forced": false
+      "nullifier": "0x1f6af2c6c78a03f861296eedd41e5b86ef0ceec291e79373bcd94a34c44c2158",
+      "forced": false,
+      "destination": "0xc1b90f51db94a2ab4599e11b4ff6c33679482b1a74021e6e97f1a87e78505dc8",
+      "sighash": "0x1c748e395301a4dfc37da34d150d1d716313179a1629f0a240891aad38d14564"
     },
     {
       "name": "forfeit",
       "index": 4,
-      "nullifier": "0x2c4533c9afc398f5d57a339bafd1c5c3d312a1e566588567f43c961358a067d6",
-      "forced": true
+      "nullifier": "0x2a19a7fd78fdefcae6d4568f8d11e2ba962f7809845b847ed657208d3511f1fc",
+      "forced": true,
+      "destination": "0xc1b90f51db94a2ab4599e11b4ff6c33679482b1a74021e6e97f1a87e78505dc8",
+      "sighash": "0x10ec66fde198470c667f13e0ea32178f03d42b7da4b52d4e1c4842aa0aee6356"
     }
   ]
 }

@@ -104,8 +104,8 @@ pub(crate) fn expect_verifier(
     Ok(())
 }
 
-/// Most public inputs any instruction here verifies (`C_burn`: four).
-pub const MAX_PUBLIC_INPUTS: usize = 4;
+/// Most public inputs any instruction here verifies (`C_burn`: five).
+pub const MAX_PUBLIC_INPUTS: usize = 5;
 
 /// CPIs `Verify` on the Groth16 verifier: `[3, proof, inputs…]` with the
 /// key account as the only account. The verifier rejects a wrong count of

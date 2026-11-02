@@ -11,9 +11,10 @@
 // smoke-fixture proves 3·5 = 15; mint-fixture proves a deterministic note
 // derived from -seed and also writes note.json (the opening);
 // burn-fixture fills a tree with N deterministic notes, burns the one at
-// index I (as its owner, or as the custodian with -forced), and also writes
-// burn.json (the leaves, the opening, root, nullifier and flag) so the e2e
-// crate can recompute the tree. pool-fixture is a whole pool lifecycle for
+// index I (as its owner, or as the custodian with -forced) to a fixed
+// destination from a fixed pool address, and also writes burn.json (the
+// leaves, the opening, root, nullifier, flag, pool, destination and sighash)
+// so the e2e crate can recompute the tree and the sighash. pool-fixture is a whole pool lifecycle for
 // the pool program's e2e test: one C_mint proof per note (N notes, one key),
 // then two C_burn proofs against the resulting tree, the owner's unshield of
 // note I and the custodian's forfeiture of note J, with pool.json describing
@@ -27,6 +28,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"crypto/sha256"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
@@ -120,13 +123,27 @@ func mintFixture(args []string) error {
 // burnFixtureFile is burn.json: enough for the e2e crate to rebuild the tree
 // and the nullifier with its own Poseidon.
 type burnFixtureFile struct {
-	Depth     int          `json:"depth"`
-	Leaves    []string     `json:"leaves"`
-	Index     uint64       `json:"index"`
-	Note      note.Opening `json:"note"`
-	Root      string       `json:"root"`
-	Nullifier string       `json:"nullifier"`
-	Forced    bool         `json:"forced"`
+	Depth       int          `json:"depth"`
+	Leaves      []string     `json:"leaves"`
+	Index       uint64       `json:"index"`
+	Note        note.Opening `json:"note"`
+	Root        string       `json:"root"`
+	Nullifier   string       `json:"nullifier"`
+	Forced      bool         `json:"forced"`
+	Pool        string       `json:"pool"`
+	Destination string       `json:"destination"`
+	SigHash     string       `json:"sighash"`
+}
+
+// Fixture addresses: the pool account and the burn destination are fixed so
+// the signed sighash is reproducible; the e2e test uses these addresses.
+var (
+	fixturePool        = fixtureAddress("private-tx fixture: pool")
+	fixtureDestination = fixtureAddress("private-tx fixture: destination")
+)
+
+func fixtureAddress(label string) [32]byte {
+	return sha256.Sum256([]byte(label))
 }
 
 func burnFixture(args []string) error {
@@ -164,15 +181,22 @@ func burnFixture(args []string) error {
 		return err
 	}
 	n := notes[*index]
-	witness := burn.Unshield(&n, &path, note.SpendingKeyFromSeed(seeds[*index]))
+	var witness *burn.Circuit
 	if *forced {
-		witness = burn.Forfeit(&n, &path)
+		witness = burn.Forfeit(&n, &path, fixturePool, fixtureDestination)
+	} else {
+		witness, err = burn.Unshield(&n, &path, note.SpendingKeyFromSeed(seeds[*index]), fixturePool, fixtureDestination)
+		if err != nil {
+			return err
+		}
 	}
 	if err := proveAndWrite("C_burn", ccs, witness, *out); err != nil {
 		return err
 	}
 	root, nf := tr.Root(), n.Nullifier()
+	sh := burn.SigHash(fixturePool, fixtureDestination, nf, n.Value)
 	file.Note, file.Root, file.Nullifier = n.ToOpening(), note.Hex32(&root), note.Hex32(&nf)
+	file.Pool, file.Destination, file.SigHash = note.HexBytes32(&fixturePool), note.HexBytes32(&fixtureDestination), note.Hex32(&sh)
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return err
@@ -194,16 +218,19 @@ func burnFixture(args []string) error {
 // per burn.
 type poolFixtureFile struct {
 	Depth int            `json:"depth"`
+	Pool  string         `json:"pool"`
 	Notes []note.Opening `json:"notes"`
 	Root  string         `json:"root"`
 	Burns []poolBurn     `json:"burns"`
 }
 
 type poolBurn struct {
-	Name      string `json:"name"`
-	Index     uint64 `json:"index"`
-	Nullifier string `json:"nullifier"`
-	Forced    bool   `json:"forced"`
+	Name        string `json:"name"`
+	Index       uint64 `json:"index"`
+	Nullifier   string `json:"nullifier"`
+	Forced      bool   `json:"forced"`
+	Destination string `json:"destination"`
+	SigHash     string `json:"sighash"`
 }
 
 func poolFixture(args []string) error {
@@ -243,7 +270,7 @@ func poolFixture(args []string) error {
 	var tr merkle.Tree
 	notes := make([]note.Note, *count)
 	seeds := make([][]byte, *count)
-	file := poolFixtureFile{Depth: merkle.Depth}
+	file := poolFixtureFile{Depth: merkle.Depth, Pool: note.HexBytes32(&fixturePool)}
 	for i := range notes {
 		seeds[i] = []byte(fmt.Sprintf("%s/%d", *seed, i))
 		notes[i] = note.FromSeed(seeds[i], 1_000_000*uint64(i+1))
@@ -269,15 +296,24 @@ func poolFixture(args []string) error {
 			return err
 		}
 		n := notes[b.index]
-		witness := burn.Unshield(&n, &path, note.SpendingKeyFromSeed(seeds[b.index]))
+		var witness *burn.Circuit
 		if b.forced {
-			witness = burn.Forfeit(&n, &path)
+			witness = burn.Forfeit(&n, &path, fixturePool, fixtureDestination)
+		} else {
+			witness, err = burn.Unshield(&n, &path, note.SpendingKeyFromSeed(seeds[b.index]), fixturePool, fixtureDestination)
+			if err != nil {
+				return err
+			}
 		}
 		if err := burnProver.writeProof(filepath.Join(*out, "burn"), b.name, witness); err != nil {
 			return err
 		}
 		nf := n.Nullifier()
-		file.Burns = append(file.Burns, poolBurn{Name: b.name, Index: b.index, Nullifier: note.Hex32(&nf), Forced: b.forced})
+		sh := burn.SigHash(fixturePool, fixtureDestination, nf, n.Value)
+		file.Burns = append(file.Burns, poolBurn{
+			Name: b.name, Index: b.index, Nullifier: note.Hex32(&nf), Forced: b.forced,
+			Destination: note.HexBytes32(&fixtureDestination), SigHash: note.Hex32(&sh),
+		})
 	}
 
 	data, err := json.MarshalIndent(file, "", "  ")

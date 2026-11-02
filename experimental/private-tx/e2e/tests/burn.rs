@@ -1,7 +1,8 @@
 //! C_burn end to end: the fixture's root is the Solana Poseidon Merkle root
 //! of the published leaves, the nullifier is the Solana Poseidon of the
 //! note's (owner_pk, rho), the `forced` flag is what the fixture says, the
-//! proof verifies through the verifier's host path, and, when the SBF
+//! sighash is the Solana Poseidon of (pool, destination, nullifier, value),
+//! the proof verifies through the verifier's host path, and, when the SBF
 //! artifact is available, through the verifier program itself.
 
 mod sbf;
@@ -14,15 +15,20 @@ use {
 const FIXTURE: &str = "burn";
 
 #[test]
-fn public_inputs_are_root_nullifier_value_and_forced() {
+fn public_inputs_are_root_nullifier_value_forced_and_sighash() {
     let g = load_groth16(FIXTURE);
     let f = BurnFixture::load(FIXTURE);
-    assert_eq!(g.public_inputs.len(), 4, "C_burn has four public inputs");
+    assert_eq!(g.public_inputs.len(), 5, "C_burn has five public inputs");
 
     let note = &f.note;
     assert_eq!(
         f.leaves[f.index as usize], note.commitment,
         "burned leaf is the note's commitment"
+    );
+    assert_eq!(
+        bytes_from_hex(&note.owner_pk),
+        note.poseidon_owner_pk(),
+        "owner_pk is not the light-poseidon hash of the owner key"
     );
     assert_eq!(
         note.commitment_bytes(),
@@ -56,12 +62,22 @@ fn public_inputs_are_root_nullifier_value_and_forced() {
         u64_to_bytes(f.forced as u64),
         "forced flag"
     );
+    assert_eq!(
+        g.public_inputs[4],
+        bytes_from_hex(&f.sighash),
+        "burn.json sighash"
+    );
+    assert_eq!(
+        g.public_inputs[4],
+        f.poseidon_sighash(),
+        "gnark sighash disagrees with light-poseidon over (pool, destination, nullifier, value)"
+    );
 }
 
 #[test]
-fn key_is_plain_groth16_with_four_public_inputs() {
+fn key_is_plain_groth16_with_five_public_inputs() {
     let g = load_groth16(FIXTURE);
-    assert_eq!(g.key.num_public_inputs(), 4);
+    assert_eq!(g.key.num_public_inputs(), 5);
     g.key.validate_for_publish().unwrap();
 }
 
@@ -90,9 +106,14 @@ fn proof_verifies_on_host_path() {
     let mut wrong = flat.clone();
     wrong[127] ^= 1;
     assert_eq!(verify(&vk, &proof, &wrong), Err(Groth16Error::ProofInvalid));
+    // Any other sighash, i.e. any other destination or pool: the owner's
+    // signature inside the proof covers this one only.
+    let mut wrong = flat.clone();
+    wrong[159] ^= 1;
+    assert_eq!(verify(&vk, &proof, &wrong), Err(Groth16Error::ProofInvalid));
     // A non-canonical scalar is rejected before the pairing.
     let mut non_canonical = flat.clone();
-    non_canonical[96..].copy_from_slice(&FR_MODULUS);
+    non_canonical[96..128].copy_from_slice(&FR_MODULUS);
     assert_eq!(
         verify(&vk, &proof, &non_canonical),
         Err(Groth16Error::NonCanonicalScalar)
@@ -113,7 +134,10 @@ fn proof_verifies_on_sbf() {
         ok.compute_units_consumed
     );
 
-    for (i, what) in ["root", "nullifier", "value", "forced"].iter().enumerate() {
+    for (i, what) in ["root", "nullifier", "value", "forced", "sighash"]
+        .iter()
+        .enumerate()
+    {
         let mut wrong = g.public_inputs.clone();
         wrong[i][31] ^= 1;
         let r = h.verify(&key_account, &g.proof.0, &wrong);

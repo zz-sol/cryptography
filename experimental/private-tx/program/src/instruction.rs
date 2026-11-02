@@ -99,9 +99,9 @@ pub fn mint(
     }
 }
 
-/// Data `[2, proof, root, nullifier, value LE, forced]`. Accounts: pool (w),
-/// payer (s, w), nullifier PDA (w), system program, verifier program, burn
-/// key, custodian (s iff forced).
+/// Data `[2, proof, root, nullifier, value LE, forced, destination]`.
+/// Accounts: pool (w), payer (s, w), nullifier PDA (w), system program,
+/// verifier program, burn key, custodian (s iff forced).
 #[allow(clippy::too_many_arguments)]
 pub fn burn(
     pool: &Address,
@@ -113,14 +113,16 @@ pub fn burn(
     nullifier: &[u8; 32],
     value: u64,
     forced: bool,
+    destination: &Address,
 ) -> Instruction {
-    let mut data = Vec::with_capacity(1 + PROOF_SIZE + 32 + 32 + 8 + 1);
+    let mut data = Vec::with_capacity(1 + PROOF_SIZE + 32 + 32 + 8 + 1 + 32);
     data.push(PoolTag::Burn as u8);
     data.extend_from_slice(proof);
     data.extend_from_slice(root);
     data.extend_from_slice(nullifier);
     data.extend_from_slice(&value.to_le_bytes());
     data.push(forced as u8);
+    data.extend_from_slice(destination.as_ref());
     Instruction {
         program_id: ID,
         accounts: vec![

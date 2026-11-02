@@ -92,9 +92,13 @@ pub fn u64_to_bytes(value: u64) -> [u8; 32] {
 
 /// The opened note behind the mint fixture (`note.json`), as written by
 /// `privtx mint-fixture`: field elements are 0x-prefixed big-endian hex.
+/// `owner_pk = Poseidon(owner_ak_x, owner_ak_y)`, the owner's spend
+/// authorizing key on the embedded curve.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct NoteOpening {
     pub value: u64,
+    pub owner_ak_x: String,
+    pub owner_ak_y: String,
     pub owner_pk: String,
     pub rho: String,
     pub r: String,
@@ -124,6 +128,30 @@ impl NoteOpening {
     pub fn poseidon_nullifier(&self) -> [u8; 32] {
         poseidon(&[fr_from_hex(&self.owner_pk), fr_from_hex(&self.rho)])
     }
+
+    /// `Poseidon(owner_ak_x, owner_ak_y)`, the owner key behind `owner_pk`.
+    pub fn poseidon_owner_pk(&self) -> [u8; 32] {
+        poseidon(&[fr_from_hex(&self.owner_ak_x), fr_from_hex(&self.owner_ak_y)])
+    }
+}
+
+/// The burn sighash, `circuits/burn.SigHash`: addresses as two 128-bit
+/// big-endian halves each.
+pub fn burn_sighash(
+    pool: &[u8; 32],
+    destination: &[u8; 32],
+    nullifier: &[u8; 32],
+    value: u64,
+) -> [u8; 32] {
+    let half = |b: &[u8]| Fr::from_be_bytes_mod_order(b);
+    poseidon(&[
+        half(&pool[..16]),
+        half(&pool[16..]),
+        half(&destination[..16]),
+        half(&destination[16..]),
+        Fr::from_be_bytes_mod_order(nullifier),
+        Fr::from(value),
+    ])
 }
 
 /// Root of the commitment tree holding `leaves` (in order) at `depth`: binary,
@@ -163,6 +191,9 @@ pub struct BurnFixture {
     pub root: String,
     pub nullifier: String,
     pub forced: bool,
+    pub pool: String,
+    pub destination: String,
+    pub sighash: String,
 }
 
 impl BurnFixture {
@@ -175,6 +206,16 @@ impl BurnFixture {
         let leaves: Vec<Fr> = self.leaves.iter().map(|l| fr_from_hex(l)).collect();
         merkle_root(&leaves, self.depth)
     }
+
+    /// The sighash recomputed from pool, destination, nullifier and value.
+    pub fn poseidon_sighash(&self) -> [u8; 32] {
+        burn_sighash(
+            &bytes_from_hex(&self.pool),
+            &bytes_from_hex(&self.destination),
+            &bytes_from_hex(&self.nullifier),
+            self.note.value,
+        )
+    }
 }
 
 /// The pool fixture (`pool.json`), as written by `privtx pool-fixture`: the
@@ -184,6 +225,7 @@ impl BurnFixture {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PoolFixture {
     pub depth: usize,
+    pub pool: String,
     pub notes: Vec<NoteOpening>,
     pub root: String,
     pub burns: Vec<PoolBurn>,
@@ -195,6 +237,8 @@ pub struct PoolBurn {
     pub index: u64,
     pub nullifier: String,
     pub forced: bool,
+    pub destination: String,
+    pub sighash: String,
 }
 
 impl PoolFixture {

@@ -4,7 +4,8 @@
 //! then equals the fixture's root and a light-poseidon tree over the same
 //! leaves, and the two burns (owner unshield, custodian forfeiture) go
 //! through with every misuse rejected: replayed nullifier, unknown root,
-//! forfeiture without the custodian, tampered public inputs.
+//! forfeiture without the custodian, swapped destination (the mempool
+//! replay the sighash exists for), tampered public inputs.
 //!
 //! Skips unless both `solana_groth16_program.so` (`SBF_OUT_DIR`) and
 //! `private_tx_pool.so` (`POOL_SBF_OUT_DIR`, default
@@ -17,7 +18,7 @@ use {
         program::{create_program_account_loader_v3, keyed_account_for_system_program},
         result::{InstructionResult, ProgramResult},
     },
-    private_tx_e2e::{bytes_from_hex, PoolBurn, PoolFixture},
+    private_tx_e2e::{burn_sighash, bytes_from_hex, PoolBurn, PoolFixture},
     private_tx_pool::{
         error::PoolError,
         instruction as pool_ix,
@@ -125,7 +126,8 @@ fn setup() -> Option<Setup> {
     let payer = Address::new_unique();
     let issuer = Address::new_unique();
     let custodian = Address::new_unique();
-    let pool = Address::new_unique();
+    // The fixture's burns were signed for this pool address.
+    let pool = Address::new_from_array(bytes_from_hex(&f.pool));
     let mut w = World {
         accounts: vec![
             (payer, funded()),
@@ -218,9 +220,20 @@ fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
     let g = s.f.burn_proof(FIXTURE, b);
     let note = &s.f.notes[b.index as usize];
     let nullifier = bytes_from_hex(&b.nullifier);
+    let destination = Address::new_from_array(bytes_from_hex(&b.destination));
     assert_eq!(g.public_inputs[0], bytes_from_hex(&s.f.root));
     assert_eq!(g.public_inputs[1], nullifier);
     assert_eq!(nullifier, note.poseidon_nullifier());
+    assert_eq!(
+        g.public_inputs[4],
+        burn_sighash(
+            s.pool.as_array(),
+            destination.as_array(),
+            &nullifier,
+            note.value
+        ),
+        "fixture sighash is not Poseidon(pool, destination, nullifier, value)"
+    );
     let mut ix = pool_ix::burn(
         &s.pool,
         &s.payer,
@@ -231,6 +244,7 @@ fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
         &nullifier,
         note.value,
         b.forced,
+        &destination,
     );
     ix.accounts[6].is_signer = custodian_signs;
     ix
@@ -369,6 +383,14 @@ fn burn_rejects_unknown_root_and_tampered_inputs() {
         sbf::assert_custom_error(&r, sbf::code::PROOF_INVALID);
         assert!(r.program_result.is_err(), "wrong {what} accepted");
     }
+
+    // The mempool replay: same proof, another destination. The program
+    // recomputes the sighash from the new destination and the proof, made
+    // over the owner's signature of the old one, no longer verifies.
+    let mut ix = burn_ix(&s, &unshield, false);
+    let dest_off = root_off + 73;
+    ix.data[dest_off..dest_off + 32].copy_from_slice(Address::new_unique().as_array());
+    sbf::assert_custom_error(&s.w.run(&ix), sbf::code::PROOF_INVALID);
 
     // The nullifier account must be the PDA for the published nullifier.
     let mut ix = burn_ix(&s, &unshield, false);

@@ -1,4 +1,5 @@
-// Package note defines the shielded-pool note and its Poseidon commitment.
+// Package note defines the shielded-pool note, its Poseidon commitment, and
+// the owner's key.
 //
 // A note is (value, owner_pk, rho, r). Its commitment is
 //
@@ -8,9 +9,12 @@
 // holds a single asset, so a note carries no asset field.
 //
 //   - value:    the amount, an unsigned 64-bit integer.
-//   - owner_pk: the recipient's public key, an opaque field element here; the
-//     key hierarchy is fixed by the protocol spec (Epic 1). DeriveOwnerPK
-//     gives the provisional derivation used by the fixtures.
+//   - owner_pk: Poseidon(ak.x, ak.y), the hash of the owner's spend
+//     authorizing key ak, a point of the twisted Edwards curve over BN254 Fr
+//     (Baby Jubjub, in gnark-crypto's a = -1 form). Spending a note means
+//     signing with the key behind ak, Zcash's spend authorization; the
+//     signature is checked in-circuit against ak (see package burn), so
+//     neither ak nor the signature is ever published.
 //   - rho:      per-note uniqueness; the nullifier input.
 //   - r:        commitment randomness, hides the other fields.
 //
@@ -25,9 +29,15 @@
 // creator can also recognize the nullifier when the note is spent. The
 // derivation is provisional (key hierarchy, Epic 1) and lives only here, so
 // every circuit that emits a nullifier changes together.
+//
+// Keys: SpendingKey is gnark-crypto's EdDSA private key on that curve; its
+// public key is ak. The EdDSA challenge hash is MiMC (gnark's native pairing
+// of signer and gadget), which need not match anything on-chain since the
+// signature only ever meets the circuit.
 package note
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -35,29 +45,44 @@ import (
 	"io"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/ecc/bn254/twistededwards"
+	"github.com/consensys/gnark-crypto/ecc/bn254/twistededwards/eddsa"
+	"github.com/consensys/gnark-crypto/hash"
 	"github.com/consensys/gnark/frontend"
+	gadgeteddsa "github.com/consensys/gnark/std/signature/eddsa"
 
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/poseidon"
 )
 
-// Note is an opened note.
+// Note is an opened note. Owner is ak, the owner's spend authorizing key;
+// the committed owner_pk is OwnerPK().
 type Note struct {
-	Value   uint64
-	OwnerPK fr.Element
-	Rho     fr.Element
-	R       fr.Element
+	Value uint64
+	Owner twistededwards.PointAffine
+	Rho   fr.Element
+	R     fr.Element
+}
+
+// OwnerPK returns Poseidon(ak.x, ak.y).
+func (n *Note) OwnerPK() fr.Element {
+	return OwnerPKOf(&n.Owner)
 }
 
 // Commitment returns Poseidon(value, owner_pk, rho, r).
 func (n *Note) Commitment() fr.Element {
 	var v fr.Element
 	v.SetUint64(n.Value)
-	return poseidon.MustHash(v, n.OwnerPK, n.Rho, n.R)
+	return poseidon.MustHash(v, n.OwnerPK(), n.Rho, n.R)
 }
 
 // Nullifier returns Poseidon(owner_pk, rho).
 func (n *Note) Nullifier() fr.Element {
-	return poseidon.MustHash(n.OwnerPK, n.Rho)
+	return poseidon.MustHash(n.OwnerPK(), n.Rho)
+}
+
+// OwnerPKOf returns Poseidon(ak.x, ak.y).
+func OwnerPKOf(ak *twistededwards.PointAffine) fr.Element {
+	return poseidon.MustHash(ak.X, ak.Y)
 }
 
 // CommitmentGadget constrains and returns Poseidon(value, owner_pk, rho, r).
@@ -70,19 +95,80 @@ func NullifierGadget(api frontend.API, ownerPK, rho frontend.Variable) (frontend
 	return poseidon.HashGadget(api, ownerPK, rho)
 }
 
-// DeriveOwnerPK is the provisional owner key derivation pk = Poseidon(sk).
-func DeriveOwnerPK(sk fr.Element) fr.Element {
-	return poseidon.MustHash(sk)
+// OwnerPKGadget constrains and returns Poseidon(ak.x, ak.y).
+func OwnerPKGadget(api frontend.API, ak gadgeteddsa.PublicKey) (frontend.Variable, error) {
+	return poseidon.HashGadget(api, ak.A.X, ak.A.Y)
 }
 
-// OwnerPKGadget constrains and returns Poseidon(sk), the owner key of sk.
-func OwnerPKGadget(api frontend.API, sk frontend.Variable) (frontend.Variable, error) {
-	return poseidon.HashGadget(api, sk)
+// SpendingKey authorizes spends of the notes owned by its public key.
+type SpendingKey struct {
+	priv *eddsa.PrivateKey
 }
 
-// Random returns a note of the given value for owner_pk with fresh rho and r.
-func Random(rng io.Reader, value uint64, ownerPK fr.Element) (Note, error) {
-	n := Note{Value: value, OwnerPK: ownerPK}
+// GenerateSpendingKey draws a key from rng.
+func GenerateSpendingKey(rng io.Reader) (SpendingKey, error) {
+	priv, err := eddsa.GenerateKey(rng)
+	if err != nil {
+		return SpendingKey{}, err
+	}
+	return SpendingKey{priv: priv}, nil
+}
+
+// Owner returns ak, the public key.
+func (k SpendingKey) Owner() twistededwards.PointAffine {
+	return k.priv.PublicKey.A
+}
+
+// Signature is a spend authorization: an EdDSA signature by the owner's key
+// over a message field element.
+type Signature struct {
+	R twistededwards.PointAffine
+	S fr.Element
+}
+
+// Sign signs msg (a field element, big-endian) with the MiMC challenge hash.
+func (k SpendingKey) Sign(msg fr.Element) (Signature, error) {
+	m := msg.Bytes()
+	raw, err := k.priv.Sign(m[:], hash.MIMC_BN254.New())
+	if err != nil {
+		return Signature{}, err
+	}
+	var sig eddsa.Signature
+	if _, err := sig.SetBytes(raw); err != nil {
+		return Signature{}, err
+	}
+	var s fr.Element
+	// S is reduced modulo the curve order, which is below r, so canonical.
+	if err := s.SetBytesCanonical(sig.S[:]); err != nil {
+		return Signature{}, err
+	}
+	return Signature{R: sig.R, S: s}, nil
+}
+
+// Vars converts the signature to circuit variables.
+func (s *Signature) Vars() gadgeteddsa.Signature {
+	var v gadgeteddsa.Signature
+	v.R.X, v.R.Y, v.S = s.R.X, s.R.Y, s.S
+	return v
+}
+
+// Dummy is a placeholder signature for witnesses that are not checked
+// (forced burns): the base point and S = 0, both well-formed so the gadget's
+// own range and curve assertions pass.
+func Dummy() Signature {
+	return Signature{R: twistededwards.GetEdwardsCurve().Base}
+}
+
+// OwnerVars converts ak to circuit variables.
+func OwnerVars(ak *twistededwards.PointAffine) gadgeteddsa.PublicKey {
+	var v gadgeteddsa.PublicKey
+	v.A.X, v.A.Y = ak.X, ak.Y
+	return v
+}
+
+// Random returns a note of the given value for owner ak with fresh rho and r.
+func Random(rng io.Reader, value uint64, ak twistededwards.PointAffine) (Note, error) {
+	n := Note{Value: value, Owner: ak}
 	if err := randomElement(rng, &n.Rho); err != nil {
 		return Note{}, err
 	}
@@ -102,21 +188,28 @@ func randomElement(rng io.Reader, out *fr.Element) error {
 }
 
 // FromSeed derives a note deterministically from a seed, for reproducible
-// fixtures: each field is SHA-256(seed ‖ label) reduced into the field, and
+// fixtures: rho and r are SHA-256(seed ‖ label) reduced into the field, and
 // the owner is SpendingKeyFromSeed(seed).
 func FromSeed(seed []byte, value uint64) Note {
 	return Note{
-		Value:   value,
-		OwnerPK: DeriveOwnerPK(SpendingKeyFromSeed(seed)),
-		Rho:     deriveFromSeed(seed, "rho"),
-		R:       deriveFromSeed(seed, "r"),
+		Value: value,
+		Owner: SpendingKeyFromSeed(seed).Owner(),
+		Rho:   deriveFromSeed(seed, "rho"),
+		R:     deriveFromSeed(seed, "r"),
 	}
 }
 
 // SpendingKeyFromSeed is the spending key of the notes FromSeed derives from
-// seed.
-func SpendingKeyFromSeed(seed []byte) fr.Element {
-	return deriveFromSeed(seed, "spending-key")
+// seed: the key generator run on SHA-256(seed ‖ "spending-key").
+func SpendingKeyFromSeed(seed []byte) SpendingKey {
+	h := sha256.New()
+	h.Write(seed)
+	h.Write([]byte("spending-key"))
+	k, err := GenerateSpendingKey(bytes.NewReader(h.Sum(nil)))
+	if err != nil {
+		panic(err) // the reader always has the 32 bytes the generator reads
+	}
+	return k
 }
 
 func deriveFromSeed(seed []byte, label string) fr.Element {
@@ -131,8 +224,11 @@ func deriveFromSeed(seed []byte, label string) fr.Element {
 // Opening is the JSON form of a note together with its commitment; field
 // elements are 0x-prefixed big-endian hex, exactly 32 bytes, canonical
 // (below the field modulus). That is the only form FromOpening accepts.
+// owner_pk is redundant with owner_ak_{x,y} and checked against them.
 type Opening struct {
 	Value      uint64 `json:"value"`
+	OwnerAKX   string `json:"owner_ak_x"`
+	OwnerAKY   string `json:"owner_ak_y"`
 	OwnerPK    string `json:"owner_pk"`
 	Rho        string `json:"rho"`
 	R          string `json:"r"`
@@ -141,17 +237,19 @@ type Opening struct {
 
 // ToOpening serializes the note and its commitment.
 func (n *Note) ToOpening() Opening {
-	cm := n.Commitment()
+	cm, pk := n.Commitment(), n.OwnerPK()
 	return Opening{
 		Value:      n.Value,
-		OwnerPK:    Hex32(&n.OwnerPK),
+		OwnerAKX:   Hex32(&n.Owner.X),
+		OwnerAKY:   Hex32(&n.Owner.Y),
+		OwnerPK:    Hex32(&pk),
 		Rho:        Hex32(&n.Rho),
 		R:          Hex32(&n.R),
 		Commitment: Hex32(&cm),
 	}
 }
 
-// FromOpening parses an Opening and checks its commitment.
+// FromOpening parses an Opening and checks its owner_pk and commitment.
 func FromOpening(o Opening) (Note, error) {
 	n := Note{Value: o.Value}
 	for _, f := range []struct {
@@ -159,7 +257,8 @@ func FromOpening(o Opening) (Note, error) {
 		src  string
 		dst  *fr.Element
 	}{
-		{"owner_pk", o.OwnerPK, &n.OwnerPK},
+		{"owner_ak_x", o.OwnerAKX, &n.Owner.X},
+		{"owner_ak_y", o.OwnerAKY, &n.Owner.Y},
 		{"rho", o.Rho, &n.Rho},
 		{"r", o.R, &n.R},
 	} {
@@ -167,7 +266,16 @@ func FromOpening(o Opening) (Note, error) {
 			return Note{}, fmt.Errorf("note: %s: %w", f.name, err)
 		}
 	}
-	var cm fr.Element
+	if !n.Owner.IsOnCurve() {
+		return Note{}, fmt.Errorf("note: owner_ak is not on the curve")
+	}
+	var pk, cm fr.Element
+	if err := ParseHex32(o.OwnerPK, &pk); err != nil {
+		return Note{}, fmt.Errorf("note: owner_pk: %w", err)
+	}
+	if got := n.OwnerPK(); !got.Equal(&pk) {
+		return Note{}, fmt.Errorf("note: owner_pk mismatch: got %s", Hex32(&got))
+	}
 	if err := ParseHex32(o.Commitment, &cm); err != nil {
 		return Note{}, fmt.Errorf("note: commitment: %w", err)
 	}
@@ -199,6 +307,11 @@ func (n *Note) UnmarshalJSON(data []byte) error {
 // Hex32 encodes e as 0x-prefixed big-endian hex, 32 bytes (66 characters).
 func Hex32(e *fr.Element) string {
 	b := e.Bytes() // big-endian, 32 bytes
+	return "0x" + hex.EncodeToString(b[:])
+}
+
+// HexBytes32 encodes 32 raw bytes as 0x-prefixed hex.
+func HexBytes32(b *[32]byte) string {
 	return "0x" + hex.EncodeToString(b[:])
 }
 
