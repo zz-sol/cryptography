@@ -17,7 +17,8 @@
 //! ```
 //!
 //! Field elements are 32-byte big-endian, as the verifier takes public inputs
-//! and the Poseidon syscall takes inputs with `Endianness::BigEndian`.
+//! and the Poseidon syscall takes inputs with `Endianness::BigEndian`. Every
+//! Poseidon call is domain-separated by a tag as its first input ([`domain`]).
 //!
 //! The tree is the standard append-only construction: `filled[h]` is the
 //! left sibling an append at height `h` would need when the new node is a
@@ -214,11 +215,38 @@ impl<'a> Pool<'a> {
     }
 }
 
-/// `Poseidon(left, right)` with the circom parameters, big-endian in and out.
+/// Poseidon domain tags (`circuits/domain`): a short ASCII name as a
+/// big-endian field element, the first input of every hash. Only the two
+/// hashes this program computes are needed here.
+pub mod domain {
+    /// Commitment tree node: `Poseidon(NODE, left, right)`.
+    pub const NODE: [u8; 32] = tag(b"privtx/node");
+    /// Burn sighash: `Poseidon(SIGHASH, pool halves, destination halves, nullifier, value)`.
+    pub const SIGHASH: [u8; 32] = tag(b"privtx/sighash");
+
+    /// The name right-aligned in 32 bytes: its big-endian integer.
+    pub const fn tag<const N: usize>(name: &[u8; N]) -> [u8; 32] {
+        assert!(N < 32);
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < N {
+            out[32 - N + i] = name[i];
+            i += 1;
+        }
+        out
+    }
+}
+
+/// `Poseidon(NODE, left, right)` with the circom parameters, big-endian in
+/// and out: the commitment tree's node hash (`circuits/merkle`).
 pub fn hash2(left: &[u8; 32], right: &[u8; 32]) -> Result<[u8; 32], ProgramError> {
-    hashv(Parameters::Bn254X5, Endianness::BigEndian, &[left, right])
-        .map(|h| h.to_bytes())
-        .map_err(|_| PoolError::PoseidonFailed.into())
+    hashv(
+        Parameters::Bn254X5,
+        Endianness::BigEndian,
+        &[&domain::NODE, left, right],
+    )
+    .map(|h| h.to_bytes())
+    .map_err(|_| PoolError::PoseidonFailed.into())
 }
 
 /// A `u64` as the 32-byte big-endian field element the circuits publish.
@@ -242,7 +270,7 @@ pub fn address_halves(a: &[u8; 32]) -> [[u8; 32]; 2] {
 /// input (`circuits/burn.SigHash`):
 ///
 /// ```text
-/// Poseidon(pool[0:16], pool[16:32], destination[0:16], destination[16:32], nullifier, value)
+/// Poseidon(SIGHASH, pool[0:16], pool[16:32], destination[0:16], destination[16:32], nullifier, value)
 /// ```
 pub fn burn_sighash(
     pool: &[u8; 32],
@@ -256,7 +284,7 @@ pub fn burn_sighash(
     hashv(
         Parameters::Bn254X5,
         Endianness::BigEndian,
-        &[&p0, &p1, &d0, &d1, nullifier, &v],
+        &[&domain::SIGHASH, &p0, &p1, &d0, &d1, nullifier, &v],
     )
     .map(|h| h.to_bytes())
     .map_err(|_| PoolError::PoseidonFailed.into())

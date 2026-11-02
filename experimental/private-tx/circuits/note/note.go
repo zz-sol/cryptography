@@ -1,38 +1,39 @@
-// Package note defines the shielded-pool note, its Poseidon commitment, and
-// the owner's key.
+// Package note defines the shielded-pool note, its Poseidon commitment and
+// nullifier, and the key hierarchy behind them. The structure is Sapling's,
+// with Poseidon for every hash and PRF and gnark-crypto's twisted Edwards
+// curve over BN254 Fr (Baby Jubjub in a = -1 form) as the embedded group.
 //
-// A note is (value, owner_pk, rho, r). Its commitment is
+// # Keys
 //
-//	cm = Poseidon(value, owner_pk, rho, r)
+//	sk                               spending key, a field element
+//	ask = KeyGen(Poseidon(ASK, sk))  spend authorizing key, EdDSA secret
+//	ak  = [ask]G                     spend authorizing public key
+//	nk  = Poseidon(NK, sk)           nullifier key
+//	fvk = (ak, nk)                   full viewing key
+//	ivk = Poseidon(IVK, ak.x, ak.y, nk)   incoming viewing key, used as a scalar
+//	g_d = GroupHash(d)               diversifier base, d an 11-byte diversifier
+//	pk_d = [ivk]g_d                  diversified transmission key
+//	address = (d, pk_d)
 //
-// with the circom-compatible Poseidon of package poseidon (width 5). Each pool
-// holds a single asset, so a note carries no asset field.
+// Spending a note needs ask (to sign) and nk (to derive the nullifier);
+// seeing and forfeiting a note needs fvk only. Institutions register their
+// clients' fvk, which is what lets the custodian audit and forfeit.
 //
-//   - value:    the amount, an unsigned 64-bit integer.
-//   - owner_pk: Poseidon(ak.x, ak.y), the hash of the owner's spend
-//     authorizing key ak, a point of the twisted Edwards curve over BN254 Fr
-//     (Baby Jubjub, in gnark-crypto's a = -1 form). Spending a note means
-//     signing with the key behind ak, Zcash's spend authorization; the
-//     signature is checked in-circuit against ak (see package burn), so
-//     neither ak nor the signature is ever published.
-//   - rho:      per-note uniqueness; the nullifier input.
-//   - r:        commitment randomness, hides the other fields.
+// # Note
 //
-// Spending or forfeiting a note publishes its nullifier
+//	note = (value, d, pk_d, r)
+//	cm   = Poseidon(CM, value, g_d.x, g_d.y, pk_d.x, pk_d.y, r)
+//	nf   = Poseidon(NF, nk, cm, leaf index)
 //
-//	nf = Poseidon(owner_pk, rho)
+// The nullifier takes the note's position, as Sapling's does (rho = cm +
+// [position]J there): two notes with the same opening are different leaves
+// and get different nullifiers, so a sender cannot hand out notes that
+// collide ("Faerie Gold"). Only the holder of nk can derive a nullifier,
+// so a note's creator cannot tell when it is spent.
 //
-// Sapling's PRF_nk(rho) with the public key in place of the secret nullifier
-// key: anyone holding the opening can derive it. That is what lets the
-// custodian, who learns openings through the audit ciphertexts, forfeit a
-// note without the owner's key (C_burn, forced); the price is that the note's
-// creator can also recognize the nullifier when the note is spent. The
-// derivation is provisional (key hierarchy, Epic 1) and lives only here, so
-// every circuit that emits a nullifier changes together.
-//
-// Keys: SpendingKey is gnark-crypto's EdDSA private key on that curve; its
-// public key is ak. The EdDSA challenge hash is MiMC (gnark's native pairing
-// of signer and gadget), which need not match anything on-chain since the
+// Every Poseidon call is domain-separated by its first input; see package
+// domain. The EdDSA challenge hash is MiMC (gnark's native pairing of signer
+// and gadget), which never needs to match anything on-chain since the
 // signature only ever meets the circuit.
 package note
 
@@ -43,93 +44,119 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/consensys/gnark-crypto/ecc/bn254/twistededwards"
 	"github.com/consensys/gnark-crypto/ecc/bn254/twistededwards/eddsa"
 	"github.com/consensys/gnark-crypto/hash"
 	"github.com/consensys/gnark/frontend"
+	gadgetted "github.com/consensys/gnark/std/algebra/native/twistededwards"
 	gadgeteddsa "github.com/consensys/gnark/std/signature/eddsa"
 
+	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/domain"
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/poseidon"
 )
 
-// Note is an opened note. Owner is ak, the owner's spend authorizing key;
-// the committed owner_pk is OwnerPK().
-type Note struct {
-	Value uint64
-	Owner twistededwards.PointAffine
-	Rho   fr.Element
-	R     fr.Element
+// DiversifierSize is the diversifier length in bytes, as in Sapling.
+const DiversifierSize = 11
+
+// Diversifier selects one of a key's addresses.
+type Diversifier [DiversifierSize]byte
+
+// Element is the diversifier as a field element (big-endian).
+func (d Diversifier) Element() fr.Element {
+	var e fr.Element
+	e.SetBytes(d[:])
+	return e
 }
 
-// OwnerPK returns Poseidon(ak.x, ak.y).
-func (n *Note) OwnerPK() fr.Element {
-	return OwnerPKOf(&n.Owner)
+// GroupHash maps the diversifier to g_d, a point of the prime-order
+// subgroup: x = Poseidon(GD, d, counter) for counter = 0, 1, ..., the first
+// x that is the abscissa of a curve point, with the smaller y, cleared of
+// the cofactor. Fails only if 256 counters give no point or the identity.
+func (d Diversifier) GroupHash() (twistededwards.PointAffine, error) {
+	params := twistededwards.GetEdwardsCurve()
+	var ctr fr.Element
+	for i := 0; i < 256; i++ {
+		ctr.SetUint64(uint64(i))
+		x := poseidon.MustHash(domain.Tag(domain.GD), d.Element(), ctr)
+		// a x² + y² = 1 + D x² y²  =>  y² = (1 - a x²) / (1 - D x²)
+		one := fr.NewElement(1)
+		var xx, num, den, y2, y fr.Element
+		xx.Square(&x)
+		num.Mul(&params.A, &xx)
+		num.Sub(&one, &num)
+		den.Mul(&params.D, &xx)
+		den.Sub(&one, &den)
+		if den.IsZero() {
+			continue
+		}
+		y2.Div(&num, &den)
+		if y.Sqrt(&y2) == nil {
+			continue
+		}
+		var negY fr.Element
+		negY.Neg(&y)
+		if negY.Cmp(&y) < 0 {
+			y = negY
+		}
+		p := twistededwards.PointAffine{X: x, Y: y}
+		p.ScalarMultiplication(&p, params.Cofactor.BigInt(new(big.Int)))
+		if p.IsZero() {
+			continue
+		}
+		return p, nil
+	}
+	return twistededwards.PointAffine{}, fmt.Errorf("note: no group hash for diversifier %x", d[:])
 }
 
-// Commitment returns Poseidon(value, owner_pk, rho, r).
-func (n *Note) Commitment() fr.Element {
-	var v fr.Element
-	v.SetUint64(n.Value)
-	return poseidon.MustHash(v, n.OwnerPK(), n.Rho, n.R)
-}
-
-// Nullifier returns Poseidon(owner_pk, rho).
-func (n *Note) Nullifier() fr.Element {
-	return poseidon.MustHash(n.OwnerPK(), n.Rho)
-}
-
-// OwnerPKOf returns Poseidon(ak.x, ak.y).
-func OwnerPKOf(ak *twistededwards.PointAffine) fr.Element {
-	return poseidon.MustHash(ak.X, ak.Y)
-}
-
-// CommitmentGadget constrains and returns Poseidon(value, owner_pk, rho, r).
-func CommitmentGadget(api frontend.API, value, ownerPK, rho, r frontend.Variable) (frontend.Variable, error) {
-	return poseidon.HashGadget(api, value, ownerPK, rho, r)
-}
-
-// NullifierGadget constrains and returns Poseidon(owner_pk, rho).
-func NullifierGadget(api frontend.API, ownerPK, rho frontend.Variable) (frontend.Variable, error) {
-	return poseidon.HashGadget(api, ownerPK, rho)
-}
-
-// OwnerPKGadget constrains and returns Poseidon(ak.x, ak.y).
-func OwnerPKGadget(api frontend.API, ak gadgeteddsa.PublicKey) (frontend.Variable, error) {
-	return poseidon.HashGadget(api, ak.A.X, ak.A.Y)
-}
-
-// SpendingKey authorizes spends of the notes owned by its public key.
+// SpendingKey is sk with the keys derived from it.
 type SpendingKey struct {
-	priv *eddsa.PrivateKey
+	sk  fr.Element
+	ask *eddsa.PrivateKey
+	nk  fr.Element
 }
 
-// GenerateSpendingKey draws a key from rng.
-func GenerateSpendingKey(rng io.Reader) (SpendingKey, error) {
-	priv, err := eddsa.GenerateKey(rng)
+// NewSpendingKey derives every key from sk.
+func NewSpendingKey(sk fr.Element) SpendingKey {
+	askSeed := poseidon.MustHash(domain.Tag(domain.ASK), sk)
+	seed := askSeed.Bytes()
+	ask, err := eddsa.GenerateKey(bytes.NewReader(seed[:]))
 	if err != nil {
+		panic(err) // the reader always has the 32 bytes the generator reads
+	}
+	return SpendingKey{
+		sk:  sk,
+		ask: ask,
+		nk:  poseidon.MustHash(domain.Tag(domain.NK), sk),
+	}
+}
+
+// GenerateSpendingKey draws sk from rng.
+func GenerateSpendingKey(rng io.Reader) (SpendingKey, error) {
+	var sk fr.Element
+	if err := randomElement(rng, &sk); err != nil {
 		return SpendingKey{}, err
 	}
-	return SpendingKey{priv: priv}, nil
+	return NewSpendingKey(sk), nil
 }
 
-// Owner returns ak, the public key.
-func (k SpendingKey) Owner() twistededwards.PointAffine {
-	return k.priv.PublicKey.A
+// SpendingKeyFromSeed is a deterministic key for fixtures and tests:
+// sk = SHA-256(seed ‖ "sk") reduced into the field.
+func SpendingKeyFromSeed(seed []byte) SpendingKey {
+	return NewSpendingKey(deriveFromSeed(seed, "sk"))
 }
 
-// Signature is a spend authorization: an EdDSA signature by the owner's key
-// over a message field element.
-type Signature struct {
-	R twistededwards.PointAffine
-	S fr.Element
+// FullViewingKey returns (ak, nk).
+func (k SpendingKey) FullViewingKey() FullViewingKey {
+	return FullViewingKey{AK: k.ask.PublicKey.A, NK: k.nk}
 }
 
-// Sign signs msg (a field element, big-endian) with the MiMC challenge hash.
+// Sign signs msg (a field element) with ask, MiMC as the challenge hash.
 func (k SpendingKey) Sign(msg fr.Element) (Signature, error) {
 	m := msg.Bytes()
-	raw, err := k.priv.Sign(m[:], hash.MIMC_BN254.New())
+	raw, err := k.ask.Sign(m[:], hash.MIMC_BN254.New())
 	if err != nil {
 		return Signature{}, err
 	}
@@ -143,6 +170,44 @@ func (k SpendingKey) Sign(msg fr.Element) (Signature, error) {
 		return Signature{}, err
 	}
 	return Signature{R: sig.R, S: s}, nil
+}
+
+// FullViewingKey sees and, through the custodian, forfeits; it cannot spend.
+type FullViewingKey struct {
+	AK twistededwards.PointAffine
+	NK fr.Element
+}
+
+// IVK returns Poseidon(IVK, ak.x, ak.y, nk), the incoming viewing key, used
+// as a scalar as is (not reduced modulo the subgroup order, so the circuit
+// and the native side agree).
+func (f *FullViewingKey) IVK() fr.Element {
+	return poseidon.MustHash(domain.Tag(domain.IVK), f.AK.X, f.AK.Y, f.NK)
+}
+
+// Address returns the payment address (d, [ivk]g_d).
+func (f *FullViewingKey) Address(d Diversifier) (Address, error) {
+	gd, err := d.GroupHash()
+	if err != nil {
+		return Address{}, err
+	}
+	ivk := f.IVK()
+	var pkd twistededwards.PointAffine
+	pkd.ScalarMultiplication(&gd, ivk.BigInt(new(big.Int)))
+	return Address{D: d, PKD: pkd}, nil
+}
+
+// Address is a diversified payment address.
+type Address struct {
+	D   Diversifier
+	PKD twistededwards.PointAffine
+}
+
+// Signature is a spend authorization: an EdDSA signature by ask over a
+// message field element.
+type Signature struct {
+	R twistededwards.PointAffine
+	S fr.Element
 }
 
 // Vars converts the signature to circuit variables.
@@ -159,19 +224,77 @@ func Dummy() Signature {
 	return Signature{R: twistededwards.GetEdwardsCurve().Base}
 }
 
-// OwnerVars converts ak to circuit variables.
-func OwnerVars(ak *twistededwards.PointAffine) gadgeteddsa.PublicKey {
-	var v gadgeteddsa.PublicKey
-	v.A.X, v.A.Y = ak.X, ak.Y
-	return v
+// PointVars converts a point to circuit variables.
+func PointVars(p *twistededwards.PointAffine) gadgetted.Point {
+	return gadgetted.Point{X: p.X, Y: p.Y}
 }
 
-// Random returns a note of the given value for owner ak with fresh rho and r.
-func Random(rng io.Reader, value uint64, ak twistededwards.PointAffine) (Note, error) {
-	n := Note{Value: value, Owner: ak}
-	if err := randomElement(rng, &n.Rho); err != nil {
-		return Note{}, err
+// AKVars converts ak to the EdDSA gadget's public key.
+func AKVars(ak *twistededwards.PointAffine) gadgeteddsa.PublicKey {
+	return gadgeteddsa.PublicKey{A: PointVars(ak)}
+}
+
+// Note is an opened note.
+type Note struct {
+	Value uint64
+	D     Diversifier
+	PKD   twistededwards.PointAffine
+	R     fr.Element
+}
+
+// GD returns g_d = GroupHash(d).
+func (n *Note) GD() twistededwards.PointAffine {
+	gd, err := n.D.GroupHash()
+	if err != nil {
+		panic(err)
 	}
+	return gd
+}
+
+// Commitment returns Poseidon(CM, value, g_d.x, g_d.y, pk_d.x, pk_d.y, r).
+func (n *Note) Commitment() fr.Element {
+	var v fr.Element
+	v.SetUint64(n.Value)
+	gd := n.GD()
+	return poseidon.MustHash(domain.Tag(domain.CM), v, gd.X, gd.Y, n.PKD.X, n.PKD.Y, n.R)
+}
+
+// Nullifier returns Poseidon(NF, nk, cm, index) for the note at leaf index.
+func Nullifier(nk, cm fr.Element, index uint64) fr.Element {
+	var i fr.Element
+	i.SetUint64(index)
+	return poseidon.MustHash(domain.Tag(domain.NF), nk, cm, i)
+}
+
+// CommitmentGadget constrains and returns Poseidon(CM, value, g_d, pk_d, r).
+func CommitmentGadget(api frontend.API, value frontend.Variable, gd, pkd gadgetted.Point, r frontend.Variable) (frontend.Variable, error) {
+	return poseidon.HashGadget(api, domain.Tag(domain.CM), value, gd.X, gd.Y, pkd.X, pkd.Y, r)
+}
+
+// NullifierGadget constrains and returns Poseidon(NF, nk, cm, index).
+func NullifierGadget(api frontend.API, nk, cm, index frontend.Variable) (frontend.Variable, error) {
+	return poseidon.HashGadget(api, domain.Tag(domain.NF), nk, cm, index)
+}
+
+// IVKGadget constrains and returns Poseidon(IVK, ak.x, ak.y, nk).
+func IVKGadget(api frontend.API, ak gadgeteddsa.PublicKey, nk frontend.Variable) (frontend.Variable, error) {
+	return poseidon.HashGadget(api, domain.Tag(domain.IVK), ak.A.X, ak.A.Y, nk)
+}
+
+// AssertNotSmallOrder constrains p to be on the curve with [8]p ≠ identity,
+// so p has a component in the prime-order subgroup and a scalar multiple of
+// it binds the scalar modulo the subgroup order. The cofactor is 8, so
+// three doublings; a point with [8]p of order 2 would have order 16, which
+// the group has none of, so [8]p ≠ identity reduces to [8]p.x ≠ 0.
+func AssertNotSmallOrder(curve gadgetted.Curve, p gadgetted.Point) {
+	curve.AssertIsOnCurve(p)
+	q := curve.Double(curve.Double(curve.Double(p)))
+	curve.API().AssertIsDifferent(q.X, 0)
+}
+
+// Random returns a note of the given value to addr with fresh r.
+func Random(rng io.Reader, value uint64, addr Address) (Note, error) {
+	n := Note{Value: value, D: addr.D, PKD: addr.PKD}
 	if err := randomElement(rng, &n.R); err != nil {
 		return Note{}, err
 	}
@@ -188,28 +311,23 @@ func randomElement(rng io.Reader, out *fr.Element) error {
 }
 
 // FromSeed derives a note deterministically from a seed, for reproducible
-// fixtures: rho and r are SHA-256(seed ‖ label) reduced into the field, and
-// the owner is SpendingKeyFromSeed(seed).
+// fixtures: the owner is SpendingKeyFromSeed(seed), the diversifier and r
+// are SHA-256(seed ‖ label).
 func FromSeed(seed []byte, value uint64) Note {
-	return Note{
-		Value: value,
-		Owner: SpendingKeyFromSeed(seed).Owner(),
-		Rho:   deriveFromSeed(seed, "rho"),
-		R:     deriveFromSeed(seed, "r"),
+	fvk := SpendingKeyFromSeed(seed).FullViewingKey()
+	addr, err := fvk.Address(DiversifierFromSeed(seed))
+	if err != nil {
+		panic(err)
 	}
+	return Note{Value: value, D: addr.D, PKD: addr.PKD, R: deriveFromSeed(seed, "r")}
 }
 
-// SpendingKeyFromSeed is the spending key of the notes FromSeed derives from
-// seed: the key generator run on SHA-256(seed ‖ "spending-key").
-func SpendingKeyFromSeed(seed []byte) SpendingKey {
-	h := sha256.New()
-	h.Write(seed)
-	h.Write([]byte("spending-key"))
-	k, err := GenerateSpendingKey(bytes.NewReader(h.Sum(nil)))
-	if err != nil {
-		panic(err) // the reader always has the 32 bytes the generator reads
-	}
-	return k
+// DiversifierFromSeed is the diversifier of the notes FromSeed derives.
+func DiversifierFromSeed(seed []byte) Diversifier {
+	h := sha256.Sum256(append(append([]byte{}, seed...), []byte("d")...))
+	var d Diversifier
+	copy(d[:], h[:])
+	return d
 }
 
 func deriveFromSeed(seed []byte, label string) fr.Element {
@@ -224,60 +342,66 @@ func deriveFromSeed(seed []byte, label string) fr.Element {
 // Opening is the JSON form of a note together with its commitment; field
 // elements are 0x-prefixed big-endian hex, exactly 32 bytes, canonical
 // (below the field modulus). That is the only form FromOpening accepts.
-// owner_pk is redundant with owner_ak_{x,y} and checked against them.
+// g_d is redundant with d and checked against it.
 type Opening struct {
-	Value      uint64 `json:"value"`
-	OwnerAKX   string `json:"owner_ak_x"`
-	OwnerAKY   string `json:"owner_ak_y"`
-	OwnerPK    string `json:"owner_pk"`
-	Rho        string `json:"rho"`
-	R          string `json:"r"`
-	Commitment string `json:"commitment"`
+	Value       uint64 `json:"value"`
+	Diversifier string `json:"d"`
+	GDX         string `json:"g_d_x"`
+	GDY         string `json:"g_d_y"`
+	PKDX        string `json:"pk_d_x"`
+	PKDY        string `json:"pk_d_y"`
+	R           string `json:"r"`
+	Commitment  string `json:"commitment"`
 }
 
 // ToOpening serializes the note and its commitment.
 func (n *Note) ToOpening() Opening {
-	cm, pk := n.Commitment(), n.OwnerPK()
+	cm, gd, d := n.Commitment(), n.GD(), n.D.Element()
 	return Opening{
-		Value:      n.Value,
-		OwnerAKX:   Hex32(&n.Owner.X),
-		OwnerAKY:   Hex32(&n.Owner.Y),
-		OwnerPK:    Hex32(&pk),
-		Rho:        Hex32(&n.Rho),
-		R:          Hex32(&n.R),
-		Commitment: Hex32(&cm),
+		Value:       n.Value,
+		Diversifier: Hex32(&d),
+		GDX:         Hex32(&gd.X),
+		GDY:         Hex32(&gd.Y),
+		PKDX:        Hex32(&n.PKD.X),
+		PKDY:        Hex32(&n.PKD.Y),
+		R:           Hex32(&n.R),
+		Commitment:  Hex32(&cm),
 	}
 }
 
-// FromOpening parses an Opening and checks its owner_pk and commitment.
+// FromOpening parses an Opening and checks g_d and the commitment.
 func FromOpening(o Opening) (Note, error) {
 	n := Note{Value: o.Value}
+	var d, gdx, gdy, cm fr.Element
 	for _, f := range []struct {
 		name string
 		src  string
 		dst  *fr.Element
 	}{
-		{"owner_ak_x", o.OwnerAKX, &n.Owner.X},
-		{"owner_ak_y", o.OwnerAKY, &n.Owner.Y},
-		{"rho", o.Rho, &n.Rho},
+		{"d", o.Diversifier, &d},
+		{"g_d_x", o.GDX, &gdx},
+		{"g_d_y", o.GDY, &gdy},
+		{"pk_d_x", o.PKDX, &n.PKD.X},
+		{"pk_d_y", o.PKDY, &n.PKD.Y},
 		{"r", o.R, &n.R},
+		{"commitment", o.Commitment, &cm},
 	} {
 		if err := ParseHex32(f.src, f.dst); err != nil {
 			return Note{}, fmt.Errorf("note: %s: %w", f.name, err)
 		}
 	}
-	if !n.Owner.IsOnCurve() {
-		return Note{}, fmt.Errorf("note: owner_ak is not on the curve")
+	db := d.Bytes()
+	for _, b := range db[:fr.Bytes-DiversifierSize] {
+		if b != 0 {
+			return Note{}, fmt.Errorf("note: d exceeds %d bytes", DiversifierSize)
+		}
 	}
-	var pk, cm fr.Element
-	if err := ParseHex32(o.OwnerPK, &pk); err != nil {
-		return Note{}, fmt.Errorf("note: owner_pk: %w", err)
+	copy(n.D[:], db[fr.Bytes-DiversifierSize:])
+	if gd := n.GD(); !gd.X.Equal(&gdx) || !gd.Y.Equal(&gdy) {
+		return Note{}, fmt.Errorf("note: g_d is not GroupHash(d)")
 	}
-	if got := n.OwnerPK(); !got.Equal(&pk) {
-		return Note{}, fmt.Errorf("note: owner_pk mismatch: got %s", Hex32(&got))
-	}
-	if err := ParseHex32(o.Commitment, &cm); err != nil {
-		return Note{}, fmt.Errorf("note: commitment: %w", err)
+	if !n.PKD.IsOnCurve() {
+		return Note{}, fmt.Errorf("note: pk_d is not on the curve")
 	}
 	if got := n.Commitment(); !got.Equal(&cm) {
 		return Note{}, fmt.Errorf("note: commitment mismatch: got %s", Hex32(&got))

@@ -1,6 +1,6 @@
 //! C_burn end to end: the fixture's root is the Solana Poseidon Merkle root
 //! of the published leaves, the nullifier is the Solana Poseidon of the
-//! note's (owner_pk, rho), the `forced` flag is what the fixture says, the
+//! (nk, commitment, leaf index), the `forced` flag is what the fixture says, the
 //! sighash is the Solana Poseidon of (pool, destination, nullifier, value),
 //! the proof verifies through the verifier's host path, and, when the SBF
 //! artifact is available, through the verifier program itself.
@@ -26,11 +26,6 @@ fn public_inputs_are_root_nullifier_value_forced_and_sighash() {
         "burned leaf is the note's commitment"
     );
     assert_eq!(
-        bytes_from_hex(&note.owner_pk),
-        note.poseidon_owner_pk(),
-        "owner_pk is not the light-poseidon hash of the owner key"
-    );
-    assert_eq!(
         note.commitment_bytes(),
         note.poseidon_commitment(),
         "gnark Poseidon gadget disagrees with light-poseidon on the commitment"
@@ -53,8 +48,8 @@ fn public_inputs_are_root_nullifier_value_forced_and_sighash() {
     );
     assert_eq!(
         g.public_inputs[1],
-        note.poseidon_nullifier(),
-        "gnark nullifier gadget disagrees with light-poseidon"
+        f.poseidon_nullifier(),
+        "gnark nullifier gadget disagrees with light-poseidon over (nk, cm, index)"
     );
     assert_eq!(g.public_inputs[2], u64_to_bytes(note.value), "public value");
     assert_eq!(

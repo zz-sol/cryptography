@@ -3,9 +3,9 @@
 // witness generation and as a gadget for membership proofs.
 //
 //	leaf          = the note commitment, as is
-//	node(l, r)    = Poseidon(l, r)
+//	node(l, r)    = Poseidon(NODE, l, r)        (NODE: package domain)
 //	empty leaf    = 0
-//	empty subtree = Poseidon(empty, empty) at each height
+//	empty subtree = node(empty, empty) at each height
 //
 // Leaves are appended left to right; the leaf index is the path from the
 // root with bit i selecting the right child at height i. The pool program
@@ -19,8 +19,14 @@ import (
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/consensys/gnark/frontend"
 
+	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/domain"
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/poseidon"
 )
+
+// node hashes two children.
+func node(left, right fr.Element) fr.Element {
+	return poseidon.MustHash(domain.Tag(domain.NODE), left, right)
+}
 
 // Depth is the tree height, so a pool holds up to 2^Depth notes. Provisional:
 // the spec fixes it (together with the root history window).
@@ -36,7 +42,7 @@ type Path struct {
 var zeros = func() [Depth + 1]fr.Element {
 	var z [Depth + 1]fr.Element // z[0] = 0, the empty leaf
 	for i := 0; i < Depth; i++ {
-		z[i+1] = poseidon.MustHash(z[i], z[i])
+		z[i+1] = node(z[i], z[i])
 	}
 	return z
 }()
@@ -78,7 +84,7 @@ func (t *Tree) levels() [][]fr.Element {
 			if 2*i+1 < len(cur) {
 				right = cur[2*i+1]
 			}
-			next[i] = poseidon.MustHash(left, right)
+			next[i] = node(left, right)
 		}
 		levels[h+1] = next
 	}
@@ -116,9 +122,9 @@ func (p *Path) Root(leaf fr.Element) fr.Element {
 	cur := leaf
 	for h := 0; h < Depth; h++ {
 		if (p.Index>>h)&1 == 1 {
-			cur = poseidon.MustHash(p.Siblings[h], cur)
+			cur = node(p.Siblings[h], cur)
 		} else {
-			cur = poseidon.MustHash(cur, p.Siblings[h])
+			cur = node(cur, p.Siblings[h])
 		}
 	}
 	return cur
@@ -148,7 +154,7 @@ func RootGadget(api frontend.API, leaf frontend.Variable, path PathVars) (fronte
 		left := api.Select(bits[h], path.Siblings[h], cur)
 		right := api.Select(bits[h], cur, path.Siblings[h])
 		var err error
-		if cur, err = poseidon.HashGadget(api, left, right); err != nil {
+		if cur, err = poseidon.HashGadget(api, domain.Tag(domain.NODE), left, right); err != nil {
 			return nil, err
 		}
 	}

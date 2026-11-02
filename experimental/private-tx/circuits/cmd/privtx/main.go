@@ -130,6 +130,7 @@ type burnFixtureFile struct {
 	Root        string       `json:"root"`
 	Nullifier   string       `json:"nullifier"`
 	Forced      bool         `json:"forced"`
+	NK          string       `json:"nk"`
 	Pool        string       `json:"pool"`
 	Destination string       `json:"destination"`
 	SigHash     string       `json:"sighash"`
@@ -180,12 +181,13 @@ func burnFixture(args []string) error {
 	if err != nil {
 		return err
 	}
-	n := notes[*index]
+	n, key := notes[*index], note.SpendingKeyFromSeed(seeds[*index])
+	fvk := key.FullViewingKey()
 	var witness *burn.Circuit
 	if *forced {
-		witness = burn.Forfeit(&n, &path, fixturePool, fixtureDestination)
+		witness = burn.Forfeit(&n, &path, fvk, fixturePool, fixtureDestination)
 	} else {
-		witness, err = burn.Unshield(&n, &path, note.SpendingKeyFromSeed(seeds[*index]), fixturePool, fixtureDestination)
+		witness, err = burn.Unshield(&n, &path, key, fixturePool, fixtureDestination)
 		if err != nil {
 			return err
 		}
@@ -193,9 +195,10 @@ func burnFixture(args []string) error {
 	if err := proveAndWrite("C_burn", ccs, witness, *out); err != nil {
 		return err
 	}
-	root, nf := tr.Root(), n.Nullifier()
+	root, nf := tr.Root(), note.Nullifier(fvk.NK, n.Commitment(), *index)
 	sh := burn.SigHash(fixturePool, fixtureDestination, nf, n.Value)
 	file.Note, file.Root, file.Nullifier = n.ToOpening(), note.Hex32(&root), note.Hex32(&nf)
+	file.NK = note.Hex32(&fvk.NK)
 	file.Pool, file.Destination, file.SigHash = note.HexBytes32(&fixturePool), note.HexBytes32(&fixtureDestination), note.Hex32(&sh)
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
@@ -229,6 +232,7 @@ type poolBurn struct {
 	Index       uint64 `json:"index"`
 	Nullifier   string `json:"nullifier"`
 	Forced      bool   `json:"forced"`
+	NK          string `json:"nk"`
 	Destination string `json:"destination"`
 	SigHash     string `json:"sighash"`
 }
@@ -295,12 +299,13 @@ func poolFixture(args []string) error {
 		if err != nil {
 			return err
 		}
-		n := notes[b.index]
+		n, key := notes[b.index], note.SpendingKeyFromSeed(seeds[b.index])
+		fvk := key.FullViewingKey()
 		var witness *burn.Circuit
 		if b.forced {
-			witness = burn.Forfeit(&n, &path, fixturePool, fixtureDestination)
+			witness = burn.Forfeit(&n, &path, fvk, fixturePool, fixtureDestination)
 		} else {
-			witness, err = burn.Unshield(&n, &path, note.SpendingKeyFromSeed(seeds[b.index]), fixturePool, fixtureDestination)
+			witness, err = burn.Unshield(&n, &path, key, fixturePool, fixtureDestination)
 			if err != nil {
 				return err
 			}
@@ -308,11 +313,11 @@ func poolFixture(args []string) error {
 		if err := burnProver.writeProof(filepath.Join(*out, "burn"), b.name, witness); err != nil {
 			return err
 		}
-		nf := n.Nullifier()
+		nf := note.Nullifier(fvk.NK, n.Commitment(), b.index)
 		sh := burn.SigHash(fixturePool, fixtureDestination, nf, n.Value)
 		file.Burns = append(file.Burns, poolBurn{
 			Name: b.name, Index: b.index, Nullifier: note.Hex32(&nf), Forced: b.forced,
-			Destination: note.HexBytes32(&fixtureDestination), SigHash: note.Hex32(&sh),
+			NK: note.Hex32(&fvk.NK), Destination: note.HexBytes32(&fixtureDestination), SigHash: note.Hex32(&sh),
 		})
 	}
 

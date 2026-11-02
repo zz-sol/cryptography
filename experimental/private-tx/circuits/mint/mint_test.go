@@ -10,15 +10,17 @@ import (
 	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/std/algebra/native/twistededwards"
 	"github.com/consensys/gnark/test"
 
+	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/domain"
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/note"
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/poseidon"
 )
 
 // NbConstraints is the R1CS size of the circuit as compiled by the pinned gnark
 // and Poseidon gadget versions; quoted in README.md.
-const NbConstraints = 363
+const NbConstraints = 468
 
 func randomNote(t *testing.T, value uint64) note.Note {
 	t.Helper()
@@ -26,7 +28,16 @@ func randomNote(t *testing.T, value uint64) note.Note {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := note.Random(rand.Reader, value, k.Owner())
+	fvk := k.FullViewingKey()
+	var d note.Diversifier
+	if _, err := rand.Read(d[:]); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := fvk.Address(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := note.Random(rand.Reader, value, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,12 +63,25 @@ func TestMintCircuit(t *testing.T) {
 	overflow.Value = big64
 	overflow.Commitment = commitmentOf(big64, &n)
 
+	// g_d of small order (the identity): the owner relation would bind
+	// nothing. The commitment is recomputed so only the order check fails.
+	smallOrder := Assignment(&n)
+	smallOrder.GD = twistededwards.Point{X: 0, Y: 1}
+	smallOrder.Commitment = commitmentWithGD(&n, 0, 1)
+
+	// pk_d off the curve.
+	offCurve := Assignment(&n)
+	offCurve.PKD = twistededwards.Point{X: 1, Y: 1}
+	offCurve.Commitment = commitmentWithPKD(&n, 1, 1)
+
 	assert := test.NewAssert(t)
 	assert.CheckCircuit(&Circuit{},
 		test.WithValidAssignment(valid),
 		test.WithInvalidAssignment(wrongCommitment),
 		test.WithInvalidAssignment(wrongValue),
 		test.WithInvalidAssignment(overflow),
+		test.WithInvalidAssignment(smallOrder),
+		test.WithInvalidAssignment(offCurve),
 		test.WithCurves(ecc.BN254),
 		test.WithBackends(backend.GROTH16),
 	)
@@ -68,7 +92,28 @@ func TestMintCircuit(t *testing.T) {
 func commitmentOf(value *big.Int, n *note.Note) fr.Element {
 	var v fr.Element
 	v.SetBigInt(value)
-	return poseidon.MustHash(v, n.OwnerPK(), n.Rho, n.R)
+	gd := n.GD()
+	return poseidon.MustHash(domain.Tag(domain.CM), v, gd.X, gd.Y, n.PKD.X, n.PKD.Y, n.R)
+}
+
+// commitmentWithGD hashes the note with another g_d, so only the point
+// checks fail.
+func commitmentWithGD(n *note.Note, x, y uint64) fr.Element {
+	var v, gx, gy fr.Element
+	v.SetUint64(n.Value)
+	gx.SetUint64(x)
+	gy.SetUint64(y)
+	return poseidon.MustHash(domain.Tag(domain.CM), v, gx, gy, n.PKD.X, n.PKD.Y, n.R)
+}
+
+// commitmentWithPKD hashes the note with another pk_d.
+func commitmentWithPKD(n *note.Note, x, y uint64) fr.Element {
+	var v, px, py fr.Element
+	v.SetUint64(n.Value)
+	px.SetUint64(x)
+	py.SetUint64(y)
+	gd := n.GD()
+	return poseidon.MustHash(domain.Tag(domain.CM), v, gd.X, gd.Y, px, py, n.R)
 }
 
 func TestZeroValueNoteIsValid(t *testing.T) {

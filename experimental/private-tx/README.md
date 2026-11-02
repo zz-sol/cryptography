@@ -57,43 +57,60 @@ for 1 to 5 inputs, and the Rust e2e crate exposes light-poseidon (the source
 `syscall/solana-bn254` generates its constants from) for circuits to check
 their in-circuit hashes against.
 
-## Note
+## Keys and notes
+
+The key hierarchy is Sapling's with Poseidon for every hash and PRF, and
+gnark-crypto's twisted Edwards curve over BN254 Fr as the embedded group
+(Baby Jubjub in `a = -1` form: same prime-order subgroup, cofactor 8).
 
 ```
-note = (value, owner_pk, rho, r)
-cm   = Poseidon(value, owner_pk, rho, r)        // width 5
+sk                                spending key, a field element
+ask = KeyGen(Poseidon(ASK, sk))   spend authorizing key (EdDSA secret)
+ak  = [ask]G                      spend authorizing public key
+nk  = Poseidon(NK, sk)            nullifier key
+fvk = (ak, nk)                    full viewing key
+ivk = Poseidon(IVK, ak.x, ak.y, nk)    incoming viewing key, used as a scalar
+g_d = GroupHash(d)                diversifier base, d an 11-byte diversifier
+pk_d = [ivk]·g_d                  diversified transmission key
+address = (d, pk_d)
 ```
 
-- `value`: `u64`.
-- `owner_pk = Poseidon(ak.x, ak.y)`: the hash of the recipient's spend
-  authorizing key `ak`, a point on the twisted Edwards curve over BN254 Fr
-  (Baby Jubjub, in gnark-crypto's `a = -1` form). The rest of the key
-  hierarchy (nullifier key, viewing keys, diversified addresses) is spec work
-  (Epic 1).
-- `rho`: per-note uniqueness, the nullifier input.
+- Spending needs `ask` (to sign) and `nk` (to derive the nullifier).
+  Seeing a note, and forfeiting it through the custodian, needs `fvk` only.
+  Institutions register their clients' `fvk`; that is what makes the
+  custodian able to audit and forfeit (§C_burn).
+- One key has as many addresses as diversifiers; without `ivk` two of them
+  are unlinkable (`pk_d = [ivk]g_d` with independent bases).
+- `GroupHash(d)`: `x = Poseidon(GD, d, counter)` for the first counter that
+  gives a curve point, smaller `y`, cofactor cleared. The circuits never
+  compute it; `g_d` is a witness checked to be on the curve and not of small
+  order, so `pk_d = [ivk]g_d` binds `ivk` modulo the full subgroup order.
+
+```
+note = (value, d, pk_d, r)
+cm   = Poseidon(CM, value, g_d.x, g_d.y, pk_d.x, pk_d.y, r)     // width 8
+nf   = Poseidon(NF, nk, cm, leaf index)                         // width 5
+```
+
+- `value`: `u64`. No asset field: the pool fixes the asset.
 - `r`: commitment randomness.
+- The nullifier takes the note's position, as Sapling's does (`rho = cm +
+  [position]J` there): two notes with the same opening are different leaves
+  with different nullifiers, so a sender cannot hand out notes that collide
+  ("Faerie Gold"). Only the holder of `nk` can derive a nullifier, so a
+  note's creator cannot tell when it is spent.
 
-No asset field: the pool fixes the asset.
-
-Spending or forfeiting a note publishes its nullifier
-
-```
-nf = Poseidon(owner_pk, rho)                   // width 3
-```
-
-This is Sapling's `PRF_nk(rho)` with the public key in place of the secret
-nullifier key, so anyone holding the opening can derive it. That is what lets
-the custodian, who learns openings through the audit ciphertexts, forfeit a
-note without the owner's key (`C_burn` with `forced = 1`); the price is that whoever created the note can
-recognize its nullifier when it is spent. The derivation is provisional (key
-hierarchy, Epic 1) and lives in one place, `note.Nullifier` and
-`note.NullifierGadget`, so every circuit that emits one changes together.
+Every Poseidon call is domain-separated: its first input is a constant tag,
+the ASCII of a short name (`privtx/cm`, `privtx/nf`, `privtx/nk`,
+`privtx/ask`, `privtx/ivk`, `privtx/gd`, `privtx/node`, `privtx/sighash`)
+read as a big-endian integer. `circuits/domain/` lists them; the pool
+program and the e2e crate spell the same strings.
 
 ## Commitment tree
 
 ```
 leaf          = commitment
-node          = Poseidon(left, right)           // width 3
+node          = Poseidon(NODE, left, right)     // width 4
 empty leaf    = 0, empty subtrees hashed up from it
 depth         = 32                              // provisional, spec decides
 ```
@@ -116,20 +133,21 @@ pool program's business (issuer authority), not the circuit's.
 | | |
 | --- | --- |
 | public inputs | `commitment`, `value` (in that order) |
-| witness | `owner_pk`, `rho`, `r` |
-| constraints | `value ∈ [0, 2^64)` by bit decomposition; `commitment = Poseidon(value, owner_pk, rho, r)` |
-| size | 363 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+| witness | `g_d`, `pk_d`, `r` |
+| constraints | `value ∈ [0, 2^64)` by bit decomposition; `g_d` on the curve and not of small order, `pk_d` on the curve; `commitment = Poseidon(CM, value, g_d, pk_d, r)` |
+| size | 468 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
 
 A confidential-issuance variant (hidden amount) is the same circuit with
-`Value` moved to the private witness.
+`Value` moved to the private witness. The point checks are Sapling's
+Output checks: without them a note could be created whose owner relation
+`pk_d = [ivk]g_d` binds only a few bits of `ivk`.
 
 The circuit touches neither Merkle tree. The commitment is a public input, so
 the pool program appends it to the commitment tree itself after verifying the
 proof; proving the insertion in-circuit would only repeat work the program
 does in the clear. Membership in the tree is proved when a note is spent, by
 `C_transfer` and `C_burn`. The nullifier set is untouched because a mint
-spends nothing: `rho` is carried in the note so that a later spend can derive
-the nullifier from it. The on-chain mint flow is therefore: verify the proof,
+spends nothing. The on-chain mint flow is therefore: verify the proof,
 check issuer authority, add `value` to minted supply, append `commitment`.
 
 ## C_burn
@@ -144,16 +162,23 @@ releases the amount (vault withdrawal, supply decrease).
 | | |
 | --- | --- |
 | public inputs | `root`, `nullifier`, `value`, `forced`, `sighash` (in that order) |
-| witness | `ak`, `rho`, `r`, signature `(R, S)`, leaf index, 32 Merkle siblings |
-| constraints | `forced ∈ {0, 1}`; `owner_pk = Poseidon(ak)`; `forced ∨ EdDSA.Verify(ak, sighash, (R, S))`; `commitment = Poseidon(value, owner_pk, rho, r)`; `root = MerkleRoot(commitment, index, siblings)`; `nullifier = Poseidon(owner_pk, rho)` |
-| size | 16327 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+| witness | `ak`, `nk`, `g_d`, `pk_d`, `r`, signature `(R, S)`, leaf index, 32 Merkle siblings |
+| constraints | `forced ∈ {0, 1}`; `ivk = Poseidon(IVK, ak, nk)`; `g_d` not of small order; `pk_d = [ivk]g_d`; `forced ∨ EdDSA.Verify(ak, sighash, (R, S))`; `cm = Poseidon(CM, value, g_d, pk_d, r)`; `root = MerkleRoot(cm, index, siblings)`; `nullifier = Poseidon(NF, nk, cm, index)` |
+| size | 20919 R1CS constraints (pinned by `TestVerifyingKeyShape`) |
+
+The owner relation `pk_d = [ivk]g_d` is checked in both modes. It is what
+ties `nk`, and so the published nullifier, to this note: a forfeiture with a
+made-up `nk` would publish a nullifier that leaves the real one unspent,
+and the note could be spent again after its value had been released. The
+scalar multiplication is gnark's complete double-and-add, not its faster
+lattice path, whose range checks are commitment-based under Groth16.
 
 Authorization follows Zcash. Spending is a **spend authorization signature**
 by the owner's key over a **sighash** of the transaction, not knowledge of a
 secret inside the proof. The sighash is
 
 ```
-sighash = Poseidon(pool[0:16], pool[16:32], destination[0:16], destination[16:32], nullifier, value)
+sighash = Poseidon(SIGHASH, pool[0:16], pool[16:32], destination[0:16], destination[16:32], nullifier, value)
 ```
 
 (Solana addresses are 256 bits, so each is two 128-bit halves.) The pool
@@ -171,27 +196,30 @@ than ten proof verifications. In-circuit it costs about 7,800 constraints
 (gnark's `std/signature/eddsa` with its MiMC challenge hash, which never
 needs to match anything on-chain), and nothing about the key, not even a
 re-randomization, is ever published. What Zcash's split buys is kept: the
-prover needs `ak` and the signature, never the spending key, so proving and
-signing can run on different machines (an HSM signs, a prover box proves).
+prover needs the full viewing key and the signature, never `ask`, so proving
+and signing can run on different machines (an HSM signs, a prover box
+proves).
 What is lost is proving before the transaction is final, since the sighash is
 a public input.
 
 - `forced = 0`, unshield: the proof carries the owner's signature over this
   transaction, so the program accepts it from anyone.
 - `forced = 1`, forfeiture: no signature check, the "alternative
-  nullifier-authorization path" the design left open. The custodian learns
-  the opening (including `ak`) from the audit ciphertext and removes the note
-  without the owner's key; the witness carries a well-formed dummy signature
-  the circuit ignores. The program must require the custodian's signature
-  whenever the flag is set; the circuit only tells it which case it is in.
+  nullifier-authorization path" the design left open. The custodian holds
+  the owner's registered full viewing key and learns the opening from the
+  audit ciphertext, and removes the note without `ask`; the witness carries
+  a well-formed dummy signature the circuit ignores. The program must
+  require the custodian's signature whenever the flag is set; the circuit
+  only tells it which case it is in.
 
 No range check on `value`: it is bound to a leaf, and every leaf was
 range-checked by the circuit that created it. The root is checked by the
 program against its root history. `C_transfer`'s spend side is this relation
 with `forced = 0` and the output notes in place of `destination`.
 
-One spec item this depends on: the audit ciphertext must carry the full
-opening (`ak`, `rho`, `r`), not only the value, for forfeiture to work.
+Two spec items this depends on: the audit ciphertext must carry the full
+opening (`d`, `pk_d`, `r`), not only the value, and clients must register
+their full viewing keys with the custodian, for forfeiture to work.
 
 ## Pool program
 
@@ -209,7 +237,7 @@ One pool account (4,256 bytes):
 | `custodian`, `issuer` | signers of forced burns and of mints |
 | `mint_key`, `burn_key` | the verifier key accounts of `C_mint` and `C_burn` |
 | `supply` | minted minus burned |
-| `next_index`, `filled[32]`, `zeros[32]` | the incremental Merkle tree (depth 32, `Poseidon(left, right)` via `sol_poseidon`), the same tree `circuits/merkle` defines |
+| `next_index`, `filled[32]`, `zeros[32]` | the incremental Merkle tree (depth 32, `Poseidon(NODE, left, right)` via `sol_poseidon`), the same tree `circuits/merkle` defines |
 | `roots[64]` | ring of recent roots a burn may prove against |
 
 Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
@@ -221,10 +249,10 @@ Nullifiers are one PDA each, `["nullifier", pool, nullifier]`, created by
 | `Mint` | pool (w), issuer (s), verifier, mint key | proof, commitment, value | verify `(commitment, value)`; append; `supply += value` |
 | `Burn` | pool (w), payer (s, w), nullifier PDA (w), system, verifier, burn key, custodian (s iff forced) | proof, root, nullifier, value, forced, destination | root ∈ history; `sighash = Poseidon(pool, destination, nullifier, value)`; verify `(root, nullifier, value, forced, sighash)`; create the PDA; `supply -= value` |
 
-Compute units under Mollusk (SBF v2, local): `InitializePool` 27.7k; `Mint`
-112k, of which 82.8k is the verifier CPI and the rest is mostly the 32
-Poseidon syscalls of the append; `Burn` 105k (unshield) / 101k (forfeit),
-five public inputs plus the sighash syscall.
+Compute units under Mollusk (SBF v2, local): `InitializePool` 37.6k; `Mint`
+122k, of which 82.8k is the verifier CPI and the rest is mostly the 32
+Poseidon syscalls of the append; `Burn` 100k (unshield or forfeit), five
+public inputs plus the sighash syscall.
 
 What it does not do yet: no vault, so `Mint` and `Burn` only move the supply
 counter and the token boundary (deposit on mint, withdrawal to `destination`
@@ -287,9 +315,9 @@ no tag newer than the required commit, so it stays on that commit.
 - `C_transfer`: spend side = `C_burn` with `forced = 0`; 2-in/2-out
   conservation, auditor ciphertexts (Baby Jubjub ElGamal gadget), and note
   encryption to the recipient, without which a transfer cannot be received.
-- The rest of the key hierarchy (nullifier key, viewing keys, diversified
-  addresses) and domain separation of the Poseidon uses in the spec; these
-  change public inputs, so they come before the pool program grows.
+- Outgoing viewing keys and note encryption to the recipient and the
+  auditor (the key hierarchy above already gives `ivk` for the key
+  agreement).
 - Pool program: vault (token boundary), `Transfer` once `C_transfer` exists,
   a real program id.
 - Client glue: Merkle path tracking from chain state, proving, transaction

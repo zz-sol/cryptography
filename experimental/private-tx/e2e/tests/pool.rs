@@ -223,7 +223,11 @@ fn burn_ix(s: &Setup, b: &PoolBurn, custodian_signs: bool) -> Instruction {
     let destination = Address::new_from_array(bytes_from_hex(&b.destination));
     assert_eq!(g.public_inputs[0], bytes_from_hex(&s.f.root));
     assert_eq!(g.public_inputs[1], nullifier);
-    assert_eq!(nullifier, note.poseidon_nullifier());
+    assert_eq!(
+        nullifier,
+        private_tx_e2e::nullifier(&bytes_from_hex(&b.nk), &note.commitment_bytes(), b.index),
+        "fixture nullifier is not Poseidon(nk, cm, index)"
+    );
     assert_eq!(
         g.public_inputs[4],
         burn_sighash(

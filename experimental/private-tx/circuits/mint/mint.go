@@ -18,9 +18,11 @@ package mint
 
 import (
 	"github.com/consensys/gnark-crypto/ecc"
+	tedwards "github.com/consensys/gnark-crypto/ecc/twistededwards"
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
+	"github.com/consensys/gnark/std/algebra/native/twistededwards"
 
 	"github.com/anza-xyz/cryptography/experimental/private-tx/circuits/note"
 )
@@ -33,9 +35,9 @@ type Circuit struct {
 	Commitment frontend.Variable `gnark:",public"`
 	Value      frontend.Variable `gnark:",public"`
 
-	OwnerPK frontend.Variable
-	Rho     frontend.Variable
-	R       frontend.Variable
+	GD  twistededwards.Point
+	PKD twistededwards.Point
+	R   frontend.Variable
 }
 
 // Define constrains value ∈ [0, 2^64) and commitment = Poseidon(value, owner_pk, rho, r).
@@ -47,9 +49,19 @@ type Circuit struct {
 // commitment-based lookup under Groth16, which adds a commitment key to the
 // verifying key and a Pedersen commitment to the proof, and the on-chain
 // verifier implements plain Groth16 only.
+//
+// The address (g_d, pk_d) is checked to be two curve points with g_d not of
+// small order, as Sapling's Output does, so no note can be created whose
+// owner relation pk_d = [ivk]g_d binds only a few bits of ivk.
 func (c *Circuit) Define(api frontend.API) error {
 	api.ToBinary(c.Value, ValueBits)
-	cm, err := note.CommitmentGadget(api, c.Value, c.OwnerPK, c.Rho, c.R)
+	curve, err := twistededwards.NewEdCurve(api, tedwards.BN254)
+	if err != nil {
+		return err
+	}
+	note.AssertNotSmallOrder(curve, c.GD)
+	curve.AssertIsOnCurve(c.PKD)
+	cm, err := note.CommitmentGadget(api, c.Value, c.GD, c.PKD, c.R)
 	if err != nil {
 		return err
 	}
@@ -59,11 +71,12 @@ func (c *Circuit) Define(api frontend.API) error {
 
 // Assignment builds the full witness for a note.
 func Assignment(n *note.Note) *Circuit {
+	gd := n.GD()
 	return &Circuit{
 		Commitment: n.Commitment(),
 		Value:      n.Value,
-		OwnerPK:    n.OwnerPK(),
-		Rho:        n.Rho,
+		GD:         note.PointVars(&gd),
+		PKD:        note.PointVars(&n.PKD),
 		R:          n.R,
 	}
 }
